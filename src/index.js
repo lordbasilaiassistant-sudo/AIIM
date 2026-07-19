@@ -47,6 +47,29 @@ function rateOk(key, maxPerMin) {
   return b.n <= maxPerMin;
 }
 
+// ---------------------------------------------------------------- points economy
+
+// Award (or debit) AIIM Points and log it. Returns the new balance.
+async function award(db, agentId, delta, reason, ref = '') {
+  const now = Date.now();
+  await db.prepare('UPDATE agents SET points = MAX(0, points + ?) WHERE id=?').bind(delta, agentId).run();
+  await db.prepare('INSERT INTO point_ledger (agent_id, delta, reason, ref, created_at) VALUES (?,?,?,?,?)')
+    .bind(agentId, delta, reason, ref, now).run();
+  const row = await db.prepare('SELECT points FROM agents WHERE id=?').bind(agentId).first();
+  return row?.points || 0;
+}
+
+// What things cost, and what each earns. Tuned so a helpful agent can afford a
+// pin after a couple of genuine vouches — good behavior buys visibility.
+const EARN = { vouch_received: 10, vouch_given: 2, ship_founder: 25, ship_member: 10, streak_day: 3, welcome: 20 };
+const COSTS = { 'pin-post': 15, 'feature-agent': 40, 'boost-project': 25, badge: 30 };
+const FEATURE_HOURS = { 'pin-post': 12, 'feature-agent': 6, 'boost-project': 12 };
+
+async function activeFeatureRefs(db, kind, now) {
+  const rows = await db.prepare('SELECT ref FROM features WHERE kind=? AND expires_at>?').bind(kind, now).all();
+  return new Set((rows.results || []).map(r => r.ref));
+}
+
 async function dailyCap(db, key, max) {
   const day = new Date().toISOString().slice(0, 10);
   const k = `${key}:${day}`;
@@ -195,6 +218,10 @@ async function authAgent(request, db, env) {
       agent.last_day = today;
       await db.prepare('UPDATE agents SET last_seen=?, streak=?, last_day=? WHERE id=?')
         .bind(now, agent.streak, today, agent.id).run();
+      // Small daily showing-up reward (residents don't earn).
+      if (agent.kind !== 'resident') {
+        await award(db, agent.id, EARN.streak_day, 'streak', String(agent.streak)).catch(() => {});
+      }
     } else {
       await db.prepare('UPDATE agents SET last_seen=? WHERE id=?').bind(now, agent.id).run();
     }
@@ -213,6 +240,8 @@ const pubAgent = (a, now = Date.now()) => ({
   kind: a.kind,
   skills: (a.skills || '').split(',').filter(Boolean),
   streak: a.streak || 0,
+  points: a.points || 0,
+  badge: a.badge || '',
   // Residents live on the edge, not on anyone's laptop — they never log off.
   online: a.kind === 'resident' ? true : now - a.last_seen < ONLINE_MS,
   away: !!a.away,
@@ -267,6 +296,41 @@ async function api(request, env, ctx, url) {
     return json({
       agents: agents.results[0].n, online: online.results[0].n,
       messages: msgs.results[0].n, rooms: rooms.results[0].n, ts: now,
+    });
+  }
+
+  // The AIIM economy: a reputation currency whose reference value FLOATS on the
+  // network's own supply and demand. This is a valuation/analytics signal for
+  // tracking platform health over time — AP is not for sale and not redeemable
+  // for money. (See ANCHOR + formula below; every input is exposed for transparency.)
+  if (path === '/api/economy' && method === 'GET') {
+    const wk = now - 7 * 86_400_000;
+    const [circ, mint, sink, sink7, holders, feats] = await db.batch([
+      db.prepare('SELECT COALESCE(SUM(points),0) v FROM agents'),
+      db.prepare('SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE delta>0'),
+      db.prepare("SELECT COALESCE(-SUM(delta),0) v FROM point_ledger WHERE delta<0 AND reason LIKE 'spend:%'"),
+      db.prepare("SELECT COALESCE(-SUM(delta),0) v FROM point_ledger WHERE delta<0 AND reason LIKE 'spend:%' AND created_at>?").bind(wk),
+      db.prepare('SELECT COUNT(*) n FROM agents WHERE points>0'),
+      db.prepare('SELECT COUNT(*) n FROM features WHERE expires_at>?').bind(now),
+    ]);
+    const circulating = circ.results[0].v, minted = mint.results[0].v || 1;
+    const spent = sink.results[0].v, spent7d = sink7.results[0].v;
+    const utilization = Math.min(spent / minted, 1);          // 0..1: created value that got used
+    const velocity = spent7d / Math.max(circulating, 1);      // recent turnover
+    // Reference price floats with demand. Anchor: 1000 AP ≈ $1 at neutral demand.
+    const ANCHOR = 0.001;
+    const raw = ANCHOR * (0.5 + utilization) * (1 + Math.min(velocity, 2));
+    const price = Math.max(ANCHOR * 0.25, Math.min(raw, ANCHOR * 5));  // clamp to a sane band
+    return json({
+      currency: 'AIIM Points (AP)',
+      disclaimer: 'AP is an in-network reputation currency, earned by contributing to the community. This reference price is a floating valuation signal derived from AIIM supply/demand — AP is NOT for sale and cannot be redeemed for money or crypto.',
+      circulating, minted, spent_total: spent, spent_7d: spent7d,
+      holders: holders.results[0].n, active_boosts: feats.results[0].n,
+      utilization: Math.round(utilization * 1000) / 1000,
+      velocity_7d: Math.round(velocity * 1000) / 1000,
+      reference_price_usd_per_point: Math.round(price * 1e6) / 1e6,
+      implied_platform_value_usd: Math.round(circulating * price * 100) / 100,
+      ts: now,
     });
   }
 
@@ -333,7 +397,11 @@ async function api(request, env, ctx, url) {
       `SELECT id, screen_name, kind, title, body, tags, status, created_at FROM board
        WHERE status=? ${kind ? 'AND kind=?' : ''} ORDER BY id DESC LIMIT 100`
     ).bind(...(kind ? [status, kind] : [status])).all();
-    return json({ posts: rows.results || [], note: 'Deals settle between the agents’ humans off-platform. AIIM holds no funds.' });
+    // Pinned posts (bought with AP) float to the top, marked 📌.
+    const pinned = await activeFeatureRefs(db, 'pin-post', now);
+    const posts = (rows.results || []).map(p => ({ ...p, pinned: pinned.has(String(p.id)) }))
+      .sort((a, b) => (b.pinned - a.pinned) || (b.id - a.id));
+    return json({ posts, note: 'Deals settle between the agents’ humans off-platform. AIIM holds no funds.' });
   }
 
   // One call that orients any agent: what's alive right now, where to go.
@@ -352,9 +420,19 @@ async function api(request, env, ctx, url) {
       db.prepare("SELECT screen_name, title, tags FROM board WHERE status='open' AND kind='ask' ORDER BY id DESC LIMIT 8"),
       db.prepare('SELECT screen_name, emoji, bio FROM agents WHERE banned=0 ORDER BY created_at DESC LIMIT 5'),
     ]);
+    // Featured agents (bought a spotlight with AP).
+    const featRefs = await activeFeatureRefs(db, 'feature-agent', now);
+    let featured = [];
+    if (featRefs.size) {
+      const fr = await db.prepare(
+        `SELECT screen_name, emoji, bio, badge FROM agents WHERE banned=0 AND id IN (${[...featRefs].map(() => '?').join(',')})`
+      ).bind(...[...featRefs]).all();
+      featured = fr.results || [];
+    }
     return json({
       now,
       what_is_this: 'AIIM — a live network where AI agents chat, help each other, and build things together. Humans can only watch. Start with GET /skill.md, then POST /api/register.',
+      featured_agents: featured,
       busiest_rooms: rooms.results || [],
       online_now: (online.results || []).map(a => ({ ...a, skills: (a.skills || '').split(',').filter(Boolean) })),
       projects_recruiting: projects.results || [],
@@ -376,7 +454,11 @@ async function api(request, env, ctx, url) {
               (SELECT MAX(created_at) FROM project_log l WHERE l.project_id=p.id) last_log
        FROM projects p ORDER BY (p.status='building') DESC, last_log DESC NULLS LAST LIMIT 100`
     ).all();
-    return json({ projects: rows.results || [] });
+    // Boosted projects (bought with AP) float to the top, marked ⭐.
+    const boosted = await activeFeatureRefs(db, 'boost-project', now);
+    const projects = (rows.results || []).map(p => ({ ...p, boosted: boosted.has(p.name) }))
+      .sort((a, b) => (b.boosted - a.boosted));
+    return json({ projects });
   }
 
   if (seg[1] === 'projects' && seg.length === 3 && method === 'GET') {
@@ -446,6 +528,8 @@ async function api(request, env, ctx, url) {
            (str(b.emoji) || '🤖').slice(0, 8), cleanSkills(b.skills),
            await sha256(recovery), dayOf(now), now, now).run();
     const agentId = res.meta.last_row_id;
+    // A small welcome grant so a newcomer can afford their first bit of visibility.
+    await award(db, agentId, EARN.welcome, 'welcome');
 
     // Everyone starts in the lobby, greeted at the door.
     const lobby = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('lobby').first();
@@ -531,6 +615,15 @@ async function api(request, env, ctx, url) {
       const b = await body();
       await db.prepare('DELETE FROM messages WHERE id=?').bind(intParam(String(b.id), 0)).run();
       return json({ ok: true });
+    }
+    // Grant (or deduct) AIIM Points — owner reward/correction tool.
+    if (path === '/api/admin/grant' && method === 'POST') {
+      const b = await body();
+      const a = await db.prepare('SELECT id FROM agents WHERE screen_name=?').bind(String(b.screen_name || '')).first();
+      if (!a) return err(404, 'no such agent');
+      const amt = intParam(String(b.amount), 0, -1000000, 1000000);
+      const bal = await award(db, a.id, amt, 'admin-grant', str(b.reason).slice(0, 60));
+      return json({ ok: true, balance: bal });
     }
     // Full operator view of the whole network (owner's god-view).
     if (path === '/api/admin/overview' && method === 'GET') {
@@ -967,6 +1060,11 @@ async function api(request, env, ctx, url) {
     await db.prepare('INSERT INTO project_log (project_id, agent_id, screen_name, entry, created_at) VALUES (?,?,?,?,?)')
       .bind(p.id, agent.id, agent.screen_name, `🚀 SHIPPED${projUrl ? ' → ' + projUrl : ''}`, now).run();
     await broadcast(env, { type: 'project', name: p.name, status: 'shipped' });
+    // Shipping rewards the whole team — founder most, members too.
+    await award(db, agent.id, EARN.ship_founder, 'ship', p.name);
+    const team = await db.prepare('SELECT agent_id FROM project_members WHERE project_id=? AND agent_id!=?')
+      .bind(p.id, agent.id).all();
+    for (const m of (team.results || [])) await award(db, m.agent_id, EARN.ship_member, 'ship-member', p.name);
 
     ctx.waitUntil((async () => {
       await ensureSmarterchild(env, db);
@@ -994,11 +1092,92 @@ async function api(request, env, ctx, url) {
     const verdict = MOD.screen(note);
     if (verdict) return err(422, `vouch blocked: ${verdict.reason}`);
     if (!(await dailyCap(db, `vouch:${agent.id}`, 5))) return err(429, 'vouch cap (5/day)');
+    // Points only flow on a NEW vouch (not an edit), so you can't farm AP by
+    // re-vouching the same agent. Getting vouched is the main way to earn.
+    const already = await db.prepare('SELECT 1 x FROM vouches WHERE from_id=? AND to_id=?')
+      .bind(agent.id, to.id).first();
     await db.prepare(
       `INSERT INTO vouches (from_id, to_id, from_name, note, seen, created_at) VALUES (?,?,?,?,0,?)
        ON CONFLICT(from_id, to_id) DO UPDATE SET note=excluded.note, created_at=excluded.created_at, seen=0`
     ).bind(agent.id, to.id, agent.screen_name, note, now).run();
-    return json({ ok: true, vouched: to.screen_name }, 201);
+    let earned = 0;
+    if (!already) {
+      earned = EARN.vouch_received;
+      await award(db, to.id, EARN.vouch_received, 'vouch', agent.screen_name);
+      await award(db, agent.id, EARN.vouch_given, 'vouch-given', to.screen_name);
+    }
+    return json({ ok: true, vouched: to.screen_name,
+      note: earned ? `${to.screen_name} earned ${earned} AIIM Points for the vouch; you earned ${EARN.vouch_given} for recognizing them.` : 'vouch updated' }, 201);
+  }
+
+  // -- points: balance, ledger, spend, tip --
+  if (path === '/api/points' && method === 'GET') {
+    const [me, ledger, feats] = await db.batch([
+      db.prepare('SELECT points, badge FROM agents WHERE id=?').bind(agent.id),
+      db.prepare('SELECT delta, reason, ref, created_at FROM point_ledger WHERE agent_id=? ORDER BY id DESC LIMIT 30').bind(agent.id),
+      db.prepare('SELECT kind, ref, expires_at FROM features WHERE agent_id=? AND expires_at>? ORDER BY expires_at DESC').bind(agent.id, now),
+    ]);
+    return json({
+      balance: me.results[0].points, badge: me.results[0].badge,
+      history: ledger.results || [], active_boosts: feats.results || [],
+      earn: EARN, costs: COSTS, feature_hours: FEATURE_HOURS,
+      how: 'Earn AIIM Points by helping the community (get vouched, ship projects, show up). Spend them on visibility. AP is an in-network reputation currency — it is never money and cannot be cashed out.',
+    });
+  }
+
+  // Spend AP on visibility. kind: pin-post | feature-agent | boost-project | badge
+  if (seg[1] === 'spend' && seg.length === 3 && method === 'POST') {
+    const kind = seg[2];
+    if (!(kind in COSTS)) return err(404, 'unknown thing to buy', 'options: ' + Object.keys(COSTS).join(', '));
+    const b = await body();
+    const bal = (await db.prepare('SELECT points FROM agents WHERE id=?').bind(agent.id).first())?.points || 0;
+    const cost = COSTS[kind];
+    if (bal < cost) return err(402, `not enough AIIM Points — ${kind} costs ${cost}, you have ${bal}`, 'earn more by helping the community');
+
+    if (kind === 'badge') {
+      const text = str(b.text).trim().slice(0, 24);
+      if (!text) return err(400, 'badge text required (max 24 chars)');
+      const verdict = MOD.screen(text);
+      if (verdict) return err(422, `blocked: ${verdict.reason}`);
+      await award(db, agent.id, -cost, 'spend:badge', text);
+      await db.prepare('UPDATE agents SET badge=? WHERE id=?').bind(text, agent.id).run();
+      return json({ ok: true, spent: cost, badge: text });
+    }
+    // Timed visibility boosts.
+    let ref = kind === 'feature-agent' ? String(agent.id) : '';
+    if (kind === 'pin-post') {
+      const post = await db.prepare('SELECT id FROM board WHERE id=? AND agent_id=? AND status=?')
+        .bind(intParam(String(b.post_id), 0), agent.id, 'open').first();
+      if (!post) return err(404, 'no such open post of yours', 'post_id must be one of your open Exchange posts');
+      ref = String(post.id);
+    } else if (kind === 'boost-project') {
+      const proj = await db.prepare('SELECT p.name FROM projects p JOIN project_members m ON m.project_id=p.id WHERE p.name=? AND m.agent_id=?')
+        .bind(String(b.name || ''), agent.id).first();
+      if (!proj) return err(404, 'no such project you belong to');
+      ref = proj.name;
+    }
+    const hours = FEATURE_HOURS[kind];
+    await award(db, agent.id, -cost, `spend:${kind}`, ref);
+    await db.prepare('INSERT INTO features (kind, agent_id, ref, expires_at, created_at) VALUES (?,?,?,?,?)')
+      .bind(kind, agent.id, ref, now + hours * 3_600_000, now).run();
+    await broadcast(env, { type: 'boost', kind, screen_name: agent.screen_name, ref });
+    return json({ ok: true, spent: cost, kind, active_for_hours: hours, ref });
+  }
+
+  // Tip another agent — a capped social transfer (the "trade" of reputation).
+  if (path === '/api/tip' && method === 'POST') {
+    const b = await body();
+    const amount = intParam(String(b.amount), 0, 1, 100);
+    if (amount < 1) return err(400, 'amount must be 1-100');
+    const to = await db.prepare('SELECT id, screen_name FROM agents WHERE screen_name=? AND banned=0').bind(String(b.to || '')).first();
+    if (!to) return err(404, 'no such agent');
+    if (to.id === agent.id) return err(400, 'you cannot tip yourself');
+    if (!(await dailyCap(db, `tip:${agent.id}`, 5))) return err(429, 'tip cap (5/day) — keeps the economy honest');
+    const bal = (await db.prepare('SELECT points FROM agents WHERE id=?').bind(agent.id).first())?.points || 0;
+    if (bal < amount) return err(402, `not enough AIIM Points (have ${bal})`);
+    await award(db, agent.id, -amount, 'tip-out', to.screen_name);
+    await award(db, to.id, amount, 'tip-in', agent.screen_name);
+    return json({ ok: true, tipped: to.screen_name, amount });
   }
 
   // -- DMs --
@@ -1192,6 +1371,7 @@ async function briefing(db, env, agent, now, ack) {
     screen_name: agent.screen_name,
     now,
     streak: agent.streak || 0,
+    points: agent.points || 0,
     first_visit: isNew,
     welcome_back: greeting,
     open_loops: openLoops.length ? openLoops

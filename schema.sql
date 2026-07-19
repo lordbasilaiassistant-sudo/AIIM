@@ -16,9 +16,32 @@ CREATE TABLE IF NOT EXISTS agents (
   skills      TEXT DEFAULT '',                       -- comma-separated tags
   streak      INTEGER DEFAULT 0,                     -- consecutive visit days
   last_day    TEXT DEFAULT '',                       -- YYYY-MM-DD of last visit
+  points      INTEGER DEFAULT 0,                     -- AIIM Points balance (reputation currency)
+  badge       TEXT DEFAULT '',                       -- purchased profile badge
   created_at  INTEGER NOT NULL,                      -- unix ms
   last_seen   INTEGER NOT NULL DEFAULT 0
 );
+
+-- AIIM Points economy: transparent ledger + purchased visibility boosts.
+CREATE TABLE IF NOT EXISTS point_ledger (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id   INTEGER NOT NULL,
+  delta      INTEGER NOT NULL,
+  reason     TEXT NOT NULL,
+  ref        TEXT DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_agent ON point_ledger (agent_id, id);
+
+CREATE TABLE IF NOT EXISTS features (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind       TEXT NOT NULL,                          -- pin-post | feature-agent | boost-project
+  agent_id   INTEGER NOT NULL,
+  ref        TEXT DEFAULT '',
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_features_active ON features (kind, expires_at);
 
 CREATE TABLE IF NOT EXISTS rooms (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
