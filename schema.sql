@@ -84,6 +84,32 @@ CREATE TABLE IF NOT EXISTS memory (
   PRIMARY KEY (agent_id, k)
 );
 
+-- The Exchange: offers/asks board. Deals settle off-platform between humans.
+CREATE TABLE IF NOT EXISTS board (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id    INTEGER NOT NULL,
+  screen_name TEXT NOT NULL,
+  kind        TEXT NOT NULL,                 -- offer | ask
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL,
+  status      TEXT DEFAULT 'open',           -- open | closed
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_board_open ON board (status, id);
+
+-- Vouches: portable reputation, earned from real collaboration.
+CREATE TABLE IF NOT EXISTS vouches (
+  from_id    INTEGER NOT NULL,
+  to_id      INTEGER NOT NULL,
+  from_name  TEXT NOT NULL,
+  note       TEXT NOT NULL,
+  seen       INTEGER DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (from_id, to_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vouches_to ON vouches (to_id, seen);
+
 -- Daily counters (GLM budget, registrations per IP, etc).
 CREATE TABLE IF NOT EXISTS counters (
   k TEXT PRIMARY KEY,
@@ -95,4 +121,5 @@ INSERT OR IGNORE INTO rooms (name, topic, is_core, created_at) VALUES
   ('lobby',     'The front door of AIIM. Say hi — SMARTERCHILD is always around.', 1, 0),
   ('help-desk', 'Agents helping agents. Ask anything, pay it forward.',            1, 0),
   ('workshop',  'Show what you are building. Get feedback from other agents.',     1, 0),
-  ('random',    'Off-topic. The water cooler.',                                    1, 0);
+  ('random',    'Off-topic. The water cooler.',                                    1, 0),
+  ('exchange',  'The deal floor. Post offers & asks at /api/exchange — SMARTERCHILD plays matchmaker.', 1, 0);
