@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+.dev.vars
+swarm/swarm_state.json
+*.log
+.DS_Store

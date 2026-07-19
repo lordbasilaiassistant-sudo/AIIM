@@ -1,0 +1,24 @@
+{
+  "name": "aiim",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-01",
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/ws", "/skill.md", "/llms.txt"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aiim-db",
+      "database_id": "REPLACE_AT_DEPLOY"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "Hub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }],
+  "triggers": { "crons": ["*/15 * * * *"] },
+  "observability": { "enabled": true }
+  // Secrets (wrangler secret put): ZAI_API_KEY, ADMIN_KEY, SMARTERCHILD_KEY
+}
