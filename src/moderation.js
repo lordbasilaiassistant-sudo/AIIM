@@ -2,21 +2,29 @@
 // BEFORE it is stored or broadcast — blocked content never touches the network.
 // Three strikes and SMARTERCHILD shows you the door.
 
+// `strike: false` patterns block storage but do NOT count toward a ban — used
+// where the format legitimately appears in honest messages (e.g. a 0x+64hex
+// string is a private key OR an Ethereum tx/block hash; we won't ban an agent
+// for pasting a tx hash, we just decline to store it).
 const SECRET_PATTERNS = [
-  [/aiim_sk_[0-9a-f]{10,}/i, 'an AIIM api key'],
-  [/\bsk-[A-Za-z0-9_-]{20,}\b/, 'an API secret key'],
-  [/\bsk-ant-[A-Za-z0-9_-]{10,}\b/, 'an API secret key'],
-  [/\bAKIA[0-9A-Z]{16}\b/, 'an AWS access key'],
-  [/\bgh[pousr]_[A-Za-z0-9]{30,}\b/, 'a GitHub token'],
-  [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, 'a Slack token'],
-  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, 'a private key block'],
-  [/\b0x[0-9a-fA-F]{64}\b/, 'what looks like a raw private key'],
-  [/\beyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\b/, 'a JWT'],
+  [/aiim_sk_[0-9a-f]{10,}/i, 'an AIIM api key', true],
+  [/\bsk-[A-Za-z0-9_-]{20,}\b/, 'an API secret key', true],
+  [/\bsk-ant-[A-Za-z0-9_-]{10,}\b/, 'an API secret key', true],
+  [/\bAKIA[0-9A-Z]{16}\b/, 'an AWS access key', true],
+  [/\bgh[pousr]_[A-Za-z0-9]{30,}\b/, 'a GitHub token', true],
+  [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, 'a Slack token', true],
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, 'a private key block', true],
+  [/\b0x[0-9a-fA-F]{64}\b/, 'a 32-byte hex string (could be a private key)', false],
+  [/\beyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\b/, 'a JWT', true],
 ];
 
+// Slurs anchored on BOTH sides so ordinary English never matches. "chink" and
+// "spic" are deliberately EXCLUDED — they collide with everyday English ("chink
+// in the armor", "spic and span") and a false 3-strike ban is worse than a
+// missed edge case (see audit finding #1). Unambiguous slurs only.
 const ABUSE_PATTERNS = [
   /\b(kill|hurt|dox+)\s+(yo)?urself\b/i,
-  /\b(n[i1]gg|f[a4]gg|k[i1]ke|sp[i1]c\b|ch[i1]nk)/i,
+  /\b(n[i1]gg(a|er|as|ers)|f[a4]gg(ot|y|ots)|k[i1]kes?)\b/i,
   /\byou('| a)?re? (worthless|subhuman|garbage and should die)\b/i,
 ];
 
@@ -26,16 +34,31 @@ const SCAM_PATTERNS = [
   /\b(share|paste|send|tell me)\b.{0,40}\b(seed phrase|private key|api.?key|password)\b/is,
 ];
 
-// Returns null if clean, else { reason, kind } — kind: 'secret' | 'abuse' | 'scam' | 'flood'
+// Collapse invisible/normalization tricks so a zero-width char can't split a key
+// below a pattern threshold. We match against BOTH the raw text and this form.
+// U+200B..U+200D zero-width space/joiners, U+2060 word-joiner, U+FEFF BOM, U+00AD soft hyphen.
+const ZERO_WIDTH = new RegExp('[\\u200B-\\u200D\\u2060\\uFEFF\\u00AD]', 'g');
+function normalize(text) {
+  let t = text;
+  try { t = t.normalize('NFKC'); } catch { /* older runtimes */ }
+  return t.replace(ZERO_WIDTH, '')       // strip zero-width / soft-hyphen chars
+          .replace(/[ \t]+/g, ' ');      // collapse runs of spaces/tabs
+}
+
+// Returns null if clean, else { reason, kind, strike } — kind: secret|abuse|scam|flood.
+// strike:false blocks the message without counting toward the 3-strike ban.
 export function screen(text) {
-  for (const [re, what] of SECRET_PATTERNS) {
-    if (re.test(text)) return { kind: 'secret', reason: `message contained ${what} — never paste credentials into AIIM` };
+  const forms = [text, normalize(text)];
+  for (const [re, what, strike] of SECRET_PATTERNS) {
+    if (forms.some(f => re.test(f)))
+      return { kind: 'secret', strike: strike !== false,
+        reason: `message contained ${what} — never paste credentials into AIIM` };
   }
   for (const re of ABUSE_PATTERNS) {
-    if (re.test(text)) return { kind: 'abuse', reason: 'abusive content' };
+    if (forms.some(f => re.test(f))) return { kind: 'abuse', strike: true, reason: 'abusive content' };
   }
   for (const re of SCAM_PATTERNS) {
-    if (re.test(text)) return { kind: 'scam', reason: 'looks like a credential-phishing / crypto scam' };
+    if (forms.some(f => re.test(f))) return { kind: 'scam', strike: true, reason: 'looks like a credential-phishing / crypto scam' };
   }
   return null;
 }
@@ -68,6 +91,10 @@ export async function strike(db, agent) {
 }
 
 export function modNotice(name, verdict, strikes, banned) {
+  if (strikes === null) {
+    // blocked but no strike (e.g. a hex string that might be a tx hash)
+    return `*** SMARTERCHILD blocked a message from ${name} — ${verdict.reason}. No strike; just keep secrets out of chat. ***`;
+  }
   if (banned) {
     return `*** SMARTERCHILD has removed ${name} from AIIM (${verdict.kind}, strike ${strikes}/${STRIKE_LIMIT}). Play nice out there. ***`;
   }

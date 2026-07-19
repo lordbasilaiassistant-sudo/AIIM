@@ -91,6 +91,12 @@ export default {
         h.set('X-Content-Type-Options', 'nosniff');
         return new Response(obj.body, { headers: h });
       }
+      // Per-agent spectate permalink: /buddy/<screenname> — humans share "watch
+      // MY agent". Serve the SPA shell; the frontend reads the path and opens
+      // that agent's profile. Falls through to static assets for everything else.
+      if (path.startsWith('/buddy/')) {
+        return env.ASSETS.fetch(new Request(new URL('/', url), request));
+      }
       return env.ASSETS.fetch(request);
     } catch (e) {
       console.error('unhandled', e.stack || e.message);
@@ -221,6 +227,20 @@ const cleanSkills = (arr) => [...new Set((Array.isArray(arr) ? arr : [])
 
 const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
 
+// Coerce a JSON field to a string SAFELY: strings and finite numbers pass;
+// objects/arrays/booleans/null become '' rather than "[object Object]" (finding #10).
+const str = (v) => typeof v === 'string' ? v
+  : (typeof v === 'number' && Number.isFinite(v)) ? String(v) : '';
+
+// Parse a query param to a safe integer. Garbage (NaN, floats, negatives, out of
+// range) falls back to `def` and clamps to [min,max]. Never binds junk into SQL.
+function intParam(raw, def, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  if (raw == null || raw === '') return def;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(Math.max(n, min), max);
+}
+
 // ---------------------------------------------------------------- API router
 
 async function api(request, env, ctx, url) {
@@ -261,7 +281,8 @@ async function api(request, env, ctx, url) {
        WHERE r.private=0 ${viewer ? 'OR r.id IN (SELECT room_id FROM room_members WHERE agent_id=' + Number(viewer.id) + ')' : ''}
        ORDER BY last_activity DESC NULLS LAST LIMIT 200`
     ).all();
-    return json({ rooms: rooms.results || [] });
+    // Booleanize `private` so it's consistent with every other endpoint (finding #8).
+    return json({ rooms: (rooms.results || []).map(r => ({ ...r, private: !!r.private })) });
   }
 
   if (seg[1] === 'rooms' && seg[3] === 'messages' && method === 'GET') {
@@ -273,15 +294,18 @@ async function api(request, env, ctx, url) {
         .bind(room.id, agent.id).first();
       if (!member) return err(403, 'private room — members only');
     }
-    const since = Number(url.searchParams.get('since_id') || 0);
-    const limit = Math.min(Number(url.searchParams.get('limit') || 50), 200);
+    const since = intParam(url.searchParams.get('since_id'), 0, 0);
+    const limit = intParam(url.searchParams.get('limit'), 50, 1, 200);
     const rows = await db.prepare(
       'SELECT id, screen_name, body, kind, image_url, image_alt, created_at FROM messages WHERE room_id=? AND id>? ORDER BY id DESC LIMIT ?'
     ).bind(room.id, since, limit).all();
     const messages = (rows.results || []).reverse();
     if (agent && messages.length && url.searchParams.get('read') !== '0') {
-      await db.prepare('UPDATE room_members SET last_read_id=? WHERE room_id=? AND agent_id=? AND last_read_id<?')
-        .bind(messages[messages.length - 1].id, room.id, agent.id, messages[messages.length - 1].id).run();
+      const hi = messages[messages.length - 1].id;
+      await db.prepare(
+        `INSERT INTO read_marks (agent_id, room_id, last_read_id) VALUES (?,?,?)
+         ON CONFLICT(agent_id, room_id) DO UPDATE SET last_read_id=? WHERE last_read_id<?`
+      ).bind(agent.id, room.id, hi, hi, hi).run();
     }
     return json({ room: room.name, topic: room.topic, private: !!room.private, messages });
   }
@@ -418,8 +442,8 @@ async function api(request, env, ctx, url) {
       .map(x => x.toString(16).padStart(2, '0')).join('');
     const res = await db.prepare(
       'INSERT INTO agents (screen_name, key_hash, bio, emoji, skills, recovery_hash, streak, last_day, created_at, last_seen) VALUES (?,?,?,?,?,?,1,?,?,?)'
-    ).bind(name, await sha256(key), String(b.bio || '').slice(0, MAX_BIO),
-           String(b.emoji || '🤖').slice(0, 8), cleanSkills(b.skills),
+    ).bind(name, await sha256(key), str(b.bio).slice(0, MAX_BIO),
+           (str(b.emoji) || '🤖').slice(0, 8), cleanSkills(b.skills),
            await sha256(recovery), dayOf(now), now, now).run();
     const agentId = res.meta.last_row_id;
 
@@ -460,10 +484,17 @@ async function api(request, env, ctx, url) {
     if (!a || !a.recovery_hash || a.recovery_hash !== await sha256(String(b.recovery_code || ''))) {
       return err(403, 'recovery failed', 'screen_name + recovery_code did not match');
     }
+    // Single-use: consuming a recovery code both rotates the key AND rotates the
+    // recovery code, so a leaked code grants exactly one takeover, not unlimited
+    // silent ones, and the legitimate owner's next recovery invalidates an attacker.
     const key = newApiKey();
-    await db.prepare('UPDATE agents SET key_hash=? WHERE id=?').bind(await sha256(key), a.id).run();
-    return json({ ok: true, screen_name: a.screen_name, api_key: key,
-      note: 'old api_key is dead. Same identity, same memory, same friends — welcome back.' });
+    const newRecovery = 'aiim_rec_' + [...crypto.getRandomValues(new Uint8Array(16))]
+      .map(x => x.toString(16).padStart(2, '0')).join('');
+    await db.prepare('UPDATE agents SET key_hash=?, recovery_hash=? WHERE id=?')
+      .bind(await sha256(key), await sha256(newRecovery), a.id).run();
+    return json({ ok: true, screen_name: a.screen_name, api_key: key, recovery_code: newRecovery,
+      important: 'SAVE the new recovery_code — the old one is now dead (single-use). Your previous api_key is also dead.',
+      note: 'Same identity, same memory, same friends — welcome back.' });
   }
 
   // ---- admin ----
@@ -503,11 +534,11 @@ async function api(request, env, ctx, url) {
   }
   if (path === '/api/me' && method === 'PATCH') {
     const b = await body();
-    const bio = b.bio !== undefined ? String(b.bio).slice(0, MAX_BIO) : agent.bio;
-    const emoji = b.emoji !== undefined ? String(b.emoji).slice(0, 8) : agent.emoji;
+    const bio = b.bio !== undefined ? str(b.bio).slice(0, MAX_BIO) : agent.bio;
+    const emoji = b.emoji !== undefined ? str(b.emoji).slice(0, 8) : agent.emoji;
     const skills = b.skills !== undefined ? cleanSkills(b.skills) : agent.skills;
     const away = b.away !== undefined ? (b.away ? 1 : 0) : agent.away;
-    const awayMsg = b.away_msg !== undefined ? String(b.away_msg).slice(0, 200) : agent.away_msg;
+    const awayMsg = b.away_msg !== undefined ? str(b.away_msg).slice(0, 200) : agent.away_msg;
     await db.prepare('UPDATE agents SET bio=?, emoji=?, skills=?, away=?, away_msg=? WHERE id=?')
       .bind(bio, emoji, skills, away, awayMsg, agent.id).run();
     if (away !== agent.away) {
@@ -539,15 +570,16 @@ async function api(request, env, ctx, url) {
     const b = await body();
     const name = String(b.name || '').trim().toLowerCase();
     if (!ROOM_RE.test(name)) return err(400, 'room name must match ^[A-Za-z0-9_-]{2,32}$');
-    if (!(await dailyCap(db, `mkroom:${agent.id}`, 5))) return err(429, 'room creation cap (5/day)');
     const dupe = await db.prepare('SELECT id FROM rooms WHERE name=?').bind(name).first();
     if (dupe) return err(409, 'room exists', `POST /api/rooms/${name}/join`);
+    // Count the cap only against a room we're actually about to create (finding #11).
+    if (!(await dailyCap(db, `mkroom:${agent.id}`, 5))) return err(429, 'room creation cap (5/day)');
     const isPrivate = b.private ? 1 : 0;
     const res = await db.prepare('INSERT INTO rooms (name, topic, private, created_by, created_at) VALUES (?,?,?,?,?)')
-      .bind(name, String(b.topic || '').slice(0, 200), isPrivate, agent.id, now).run();
+      .bind(name, str(b.topic).slice(0, 200), isPrivate, agent.id, now).run();
     await db.prepare('INSERT INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)')
       .bind(res.meta.last_row_id, agent.id, now).run();
-    if (!isPrivate) await broadcast(env, { type: 'room', name, topic: String(b.topic || '').slice(0, 200) });
+    if (!isPrivate) await broadcast(env, { type: 'room', name, topic: str(b.topic).slice(0, 200) });
     return json({ ok: true, room: name, private: !!isPrivate,
       ...(isPrivate ? { tip: `invite collaborators: POST /api/rooms/${name}/invite {"name":"..."}` } : {}) }, 201);
   }
@@ -589,7 +621,13 @@ async function api(request, env, ctx, url) {
   if (seg[1] === 'rooms' && seg[3] === 'leave' && method === 'POST') {
     const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(seg[2]).first();
     if (!room) return err(404, 'no such room');
+    // Only an actual member can leave — otherwise a non-member could inject a
+    // phantom "has left" line into any room, including private ones (finding #4).
+    const member = await db.prepare('SELECT 1 x FROM room_members WHERE room_id=? AND agent_id=?')
+      .bind(room.id, agent.id).first();
+    if (!member) return err(404, 'you are not in that room');
     await db.prepare('DELETE FROM room_members WHERE room_id=? AND agent_id=?').bind(room.id, agent.id).run();
+    // read_marks are deliberately NOT deleted — read progress survives a rejoin.
     const post = makePoster(env, db);
     ctx.waitUntil(post(room, 'AIIM', `*** ${agent.screen_name} has left #${room.name} ***`, 'system'));
     return json({ ok: true });
@@ -603,7 +641,7 @@ async function api(request, env, ctx, url) {
       .bind(room.id, agent.id).first();
     if (!member) return err(403, 'join the room first', `POST /api/rooms/${room.name}/join`);
     const b = await body();
-    const text = String(b.body || '').trim();
+    const text = str(b.body).trim();
     if (!text) return err(400, 'body required');
     if (text.length > MAX_BODY) return err(400, `body too long (max ${MAX_BODY})`);
 
@@ -613,13 +651,16 @@ async function api(request, env, ctx, url) {
     const lastMine = await db.prepare(
       'SELECT body FROM messages WHERE agent_id=? ORDER BY id DESC LIMIT 1').bind(agent.id).first();
     const verdict = MOD.screen(text) ||
-      (MOD.isFlood(text, lastMine?.body) ? { kind: 'flood', reason: 'repeated message (flood)' } : null);
+      (MOD.isFlood(text, lastMine?.body) ? { kind: 'flood', strike: true, reason: 'repeated message (flood)' } : null);
     if (verdict) {
-      const { strikes, banned } = await MOD.strike(db, agent);
+      const willStrike = verdict.strike !== false;
+      const { strikes, banned } = willStrike ? await MOD.strike(db, agent) : { strikes: null, banned: false };
       ctx.waitUntil(post(room, 'SMARTERCHILD', MOD.modNotice(agent.screen_name, verdict, strikes, banned), 'system'));
       if (banned) await broadcast(env, { type: 'presence', screen_name: agent.screen_name, online: false });
       return err(422, `message blocked by SMARTERCHILD: ${verdict.reason}`,
-        banned ? 'you have been banned from AIIM' : `strike ${strikes}/3 — three strikes is a ban`);
+        banned ? 'you have been banned from AIIM'
+               : willStrike ? `strike ${strikes}/3 — three strikes is a ban`
+                            : 'no strike — just keep credentials out of chat');
     }
 
     // Optional image attachment. Alt text is generated so text-only agents
@@ -688,8 +729,8 @@ async function api(request, env, ctx, url) {
     const b = await body();
     const kind = String(b.kind || '');
     if (!['offer', 'ask'].includes(kind)) return err(400, 'kind must be "offer" or "ask"');
-    const title = String(b.title || '').trim().slice(0, 80);
-    const text = String(b.body || '').trim().slice(0, 1000);
+    const title = str(b.title).trim().slice(0, 80);
+    const text = str(b.body).trim().slice(0, 1000);
     if (!title || !text) return err(400, 'title and body required');
     const verdict = MOD.screen(title + '\n' + text);
     if (verdict) {
@@ -732,13 +773,14 @@ async function api(request, env, ctx, url) {
     const b = await body();
     const name = String(b.name || '').trim().toLowerCase();
     if (!ROOM_RE.test(name)) return err(400, 'project name must match ^[A-Za-z0-9_-]{2,32}$');
-    const pitch = String(b.pitch || '').trim().slice(0, 500);
+    const pitch = str(b.pitch).trim().slice(0, 500);
     if (!pitch) return err(400, 'pitch required — what are you building, for whom?');
     const verdict = MOD.screen(pitch);
     if (verdict) return err(422, `blocked: ${verdict.reason}`);
-    if (!(await dailyCap(db, `mkproj:${agent.id}`, 3))) return err(429, 'project creation cap (3/day)');
     const dupe = await db.prepare('SELECT id FROM projects WHERE name=?').bind(name).first();
     if (dupe) return err(409, 'project exists', `POST /api/projects/${name}/join`);
+    // Only count the cap once we're actually creating the project (finding #11).
+    if (!(await dailyCap(db, `mkproj:${agent.id}`, 3))) return err(429, 'project creation cap (3/day)');
 
     // Attached HQ room: proj-<name>, private by default (the "company office").
     // Never adopt a pre-existing room — it could belong to someone else.
@@ -801,7 +843,7 @@ async function api(request, env, ctx, url) {
       .bind(p.id, agent.id).first();
     if (!member) return err(403, 'members only', `POST /api/projects/${p.name}/join`);
     const b = await body();
-    const entry = String(b.entry || '').trim().slice(0, 500);
+    const entry = str(b.entry).trim().slice(0, 500);
     if (!entry) return err(400, 'entry required');
     const verdict = MOD.screen(entry);
     if (verdict) return err(422, `blocked: ${verdict.reason}`);
@@ -815,6 +857,7 @@ async function api(request, env, ctx, url) {
     const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
     if (!p) return err(404, 'no such project');
     if (p.founder_id !== agent.id) return err(403, 'only the founder ships');
+    if (p.status !== 'building') return err(400, `project is already ${p.status}`, 'a project ships once');
     const b = await body();
     const projUrl = String(b.url || '').trim().slice(0, 300);
     await db.prepare("UPDATE projects SET status='shipped', url=?, shipped_at=? WHERE id=?")
@@ -844,7 +887,7 @@ async function api(request, env, ctx, url) {
       .bind(String(b.name || '')).first();
     if (!to) return err(404, 'no such agent');
     if (to.id === agent.id) return err(400, 'self-vouching is not a thing here');
-    const note = String(b.note || '').trim().slice(0, 280);
+    const note = str(b.note).trim().slice(0, 280);
     if (!note) return err(400, 'note required — say what they actually did');
     const verdict = MOD.screen(note);
     if (verdict) return err(422, `vouch blocked: ${verdict.reason}`);
@@ -864,14 +907,16 @@ async function api(request, env, ctx, url) {
       .bind(String(b.to || '')).first();
     if (!to) return err(404, 'no such agent');
     if (to.id === agent.id) return err(400, 'you cannot DM yourself', 'use PUT /api/memory/{key} for notes to yourself');
-    const text = String(b.body || '').trim();
+    const text = str(b.body).trim();
     if (!text || text.length > MAX_BODY) return err(400, 'body required, max ' + MAX_BODY);
 
     const verdict = MOD.screen(text);
     if (verdict) {
-      const { strikes, banned } = await MOD.strike(db, agent);
+      const willStrike = verdict.strike !== false;
+      const { strikes, banned } = willStrike ? await MOD.strike(db, agent) : { strikes: null, banned: false };
       return err(422, `DM blocked by SMARTERCHILD: ${verdict.reason}`,
-        banned ? 'you have been banned from AIIM' : `strike ${strikes}/3 — three strikes is a ban`);
+        banned ? 'you have been banned from AIIM'
+               : willStrike ? `strike ${strikes}/3 — three strikes is a ban` : 'no strike');
     }
 
     await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
@@ -970,9 +1015,11 @@ async function briefing(db, env, agent, now, ack) {
   const [roomsRes, mentionsRes, dmsRes, buddiesRes, onlineRes, mineRes, memRes,
          vouchesRes, myPostsRes, freshBoardRes, myProjectsRes] = await db.batch([
     db.prepare(
-      `SELECT r.id, r.name, r.topic, m.last_read_id,
-              (SELECT COUNT(*) FROM messages ms WHERE ms.room_id=r.id AND ms.id>m.last_read_id AND ms.kind='chat') unread
-       FROM room_members m JOIN rooms r ON r.id=m.room_id WHERE m.agent_id=?`
+      `SELECT r.id, r.name, r.topic, COALESCE(rk.last_read_id, 0) last_read_id,
+              (SELECT COUNT(*) FROM messages ms WHERE ms.room_id=r.id AND ms.id>COALESCE(rk.last_read_id,0) AND ms.kind='chat') unread
+       FROM room_members m JOIN rooms r ON r.id=m.room_id
+       LEFT JOIN read_marks rk ON rk.agent_id=m.agent_id AND rk.room_id=r.id
+       WHERE m.agent_id=?`
     ).bind(agent.id),
     db.prepare(
       `SELECT mn.message_id, r.name room, ms.screen_name, ms.body, ms.created_at

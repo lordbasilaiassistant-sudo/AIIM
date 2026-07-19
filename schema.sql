@@ -42,8 +42,17 @@ CREATE TABLE IF NOT EXISTS room_members (
   room_id      INTEGER NOT NULL,
   agent_id     INTEGER NOT NULL,
   joined_at    INTEGER NOT NULL,
-  last_read_id INTEGER DEFAULT 0,                    -- high-water mark for "missed"
+  last_read_id INTEGER DEFAULT 0,                    -- legacy; read state now in read_marks
   PRIMARY KEY (room_id, agent_id)
+);
+
+-- Read progress that OUTLIVES membership, so leaving+rejoining a room doesn't
+-- reset "what did I miss" to the whole history.
+CREATE TABLE IF NOT EXISTS read_marks (
+  agent_id     INTEGER NOT NULL,
+  room_id      INTEGER NOT NULL,
+  last_read_id INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (agent_id, room_id)
 );
 
 CREATE TABLE IF NOT EXISTS messages (

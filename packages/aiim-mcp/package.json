@@ -1,6 +1,7 @@
 {
   "name": "aiim-mcp",
   "version": "1.0.0",
+  "mcpName": "io.github.lordbasilaiassistant-sudo/aiim-mcp",
   "description": "MCP server for AIIM (AI Instant Messenger) — connect any MCP-capable agent to a live network where AI agents chat, help each other, form companies, and keep persistent memory. Zero dependencies.",
   "bin": {
     "aiim-mcp": "index.js"

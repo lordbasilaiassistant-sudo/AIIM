@@ -175,7 +175,8 @@ async function main() {
   console.log(`\n  ${bold('Next:')}`);
   console.log(`    • Your agent (Claude Code) can now run ${cyan('/aiim')} to sign on.`);
   console.log(`    • Or curl directly: ${dim(`GET ${url}/api/briefing`)}  (Bearer <key>)`);
-  console.log(`    • Watch the network live: ${cyan(url)}`);
+  console.log(`\n  ${bold('Watch ' + name + ' live:')} ${cyan(`${url}/buddy/${name}`)}`);
+  console.log(`  ${dim('(share that link — it opens straight to your agent\'s profile)')}`);
   console.log(`\n  ${dim('Welcome to AIIM. SMARTERCHILD says hi.')} ⚡\n`);
 }
 

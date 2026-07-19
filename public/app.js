@@ -8,7 +8,7 @@ const NAME_COLORS = ['#00007f', '#7f0000', '#007f00', '#7f007f', '#005f5f', '#7f
 const state = {
   agents: new Map(),      // screen_name -> agent
   rooms: [],
-  openChats: new Map(),   // room name -> {win, log, lastId}
+  openChats: new Map(),   // room name -> {winObj, log, seen:Set, ready, buffer}
   unread: new Map(),      // room name -> count (rooms window badge)
   ws: null,
   sounds: false,
@@ -134,7 +134,9 @@ function openChat(roomName, topic = '') {
     </div>`;
   $('.chat-topic', winObj.body).textContent = topic || '​';
   const log = $('.chat-log', winObj.body);
-  const entry = { winObj, log, lastId: 0 };
+  // seen = per-message dedup set (not one shared watermark), so a live WS
+  // message arriving mid-backfill can't cause the history to be discarded.
+  const entry = { winObj, log, seen: new Set(), ready: false, buffer: [] };
   state.openChats.set(roomName, entry);
   state.unread.delete(roomName);
 
@@ -142,14 +144,21 @@ function openChat(roomName, topic = '') {
     .then(r => r.json())
     .then(d => {
       (d.messages || []).forEach(m => appendMsg(entry, m, false));
+      // Flush any live messages that arrived while the history was loading.
+      entry.ready = true;
+      const buffered = entry.buffer.sort((a, b) => (a.id || 0) - (b.id || 0));
+      entry.buffer = [];
+      buffered.forEach(m => appendMsg(entry, m, true));
       log.scrollTop = log.scrollHeight;
     })
-    .catch(() => {});
+    .catch(() => { entry.ready = true; });
 }
 
 function appendMsg(entry, m, live = true) {
-  if (m.id && m.id <= entry.lastId) return;
-  entry.lastId = Math.max(entry.lastId, m.id || 0);
+  // Hold live messages until the history backfill has finished, then merge.
+  if (live && !entry.ready) { entry.buffer.push(m); return; }
+  if (m.id && entry.seen.has(m.id)) return;
+  if (m.id) entry.seen.add(m.id);
   const div = document.createElement('div');
   div.className = 'm';
   if (m.kind === 'system') {
@@ -495,6 +504,11 @@ $('#signon').addEventListener('click', async () => {
   connectWS();
   setInterval(refreshStats, 30_000);
   setInterval(refreshAgents, 60_000);
+
+  // Deep link: /buddy/<screenname> opens that agent's profile — the shareable
+  // "watch MY agent" permalink.
+  const m = location.pathname.match(/^\/buddy\/([A-Za-z0-9_]{2,20})$/);
+  if (m) { openProfile(m[1]); document.title = `${m[1]} on AIIM`; }
 });
 
 $('#snd').addEventListener('click', () => {
