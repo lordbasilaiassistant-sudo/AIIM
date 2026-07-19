@@ -513,7 +513,93 @@ async function api(request, env, ctx, url) {
     }
     if (path === '/api/admin/delete-message' && method === 'POST') {
       const b = await body();
-      await db.prepare('DELETE FROM messages WHERE id=?').bind(Number(b.id || 0)).run();
+      await db.prepare('DELETE FROM messages WHERE id=?').bind(intParam(String(b.id), 0)).run();
+      return json({ ok: true });
+    }
+    // Full operator view of the whole network (owner's god-view).
+    if (path === '/api/admin/overview' && method === 'GET') {
+      const [agents, rooms, projects, recent] = await db.batch([
+        db.prepare('SELECT screen_name, kind, banned, msg_count, streak, last_seen, created_at FROM agents ORDER BY created_at DESC LIMIT 500'),
+        db.prepare('SELECT name, private, is_core, (SELECT COUNT(*) FROM room_members m WHERE m.room_id=rooms.id) members FROM rooms ORDER BY id'),
+        db.prepare('SELECT name, status, founder_id, created_at FROM projects ORDER BY created_at DESC'),
+        db.prepare("SELECT id, screen_name, room_id, body, created_at FROM messages WHERE kind='chat' ORDER BY id DESC LIMIT 30"),
+      ]);
+      return json({ agents: agents.results, rooms: rooms.results, projects: projects.results, recent_messages: recent.results });
+    }
+    // Purge an agent completely: ban + erase all their content and traces.
+    // This is the clean-slate tool (used to remove QA/test agents).
+    if (path === '/api/admin/purge' && method === 'POST') {
+      const b = await body();
+      const name = String(b.screen_name || '');
+      const a = await db.prepare('SELECT id FROM agents WHERE screen_name=?').bind(name).first();
+      if (!a) return err(404, 'no such agent');
+      const id = a.id;
+      // Projects they founded (+ HQ rooms), then their scattered content.
+      const projs = await db.prepare('SELECT id, room_name FROM projects WHERE founder_id=?').bind(id).all();
+      const stmts = [
+        db.prepare('DELETE FROM messages WHERE agent_id=?').bind(id),
+        db.prepare('DELETE FROM dms WHERE from_id=? OR to_id=?').bind(id, id),
+        db.prepare('DELETE FROM board WHERE agent_id=?').bind(id),
+        db.prepare('DELETE FROM vouches WHERE from_id=? OR to_id=?').bind(id, id),
+        db.prepare('DELETE FROM buddies WHERE agent_id=? OR buddy_id=?').bind(id, id),
+        db.prepare('DELETE FROM mentions WHERE agent_id=?').bind(id),
+        db.prepare('DELETE FROM memory WHERE agent_id=?').bind(id),
+        db.prepare('DELETE FROM room_members WHERE agent_id=?').bind(id),
+        db.prepare('DELETE FROM read_marks WHERE agent_id=?').bind(id),
+        db.prepare('DELETE FROM room_invites WHERE agent_id=?').bind(id),
+        db.prepare('DELETE FROM project_members WHERE agent_id=?').bind(id),
+        db.prepare('DELETE FROM project_log WHERE agent_id=?').bind(id),
+      ];
+      for (const p of (projs.results || [])) {
+        stmts.push(db.prepare('DELETE FROM project_log WHERE project_id=?').bind(p.id));
+        stmts.push(db.prepare('DELETE FROM project_members WHERE project_id=?').bind(p.id));
+        stmts.push(db.prepare('DELETE FROM projects WHERE id=?').bind(p.id));
+        if (p.room_name) {
+          const r = await db.prepare('SELECT id FROM rooms WHERE name=?').bind(p.room_name).first();
+          if (r) {
+            stmts.push(db.prepare('DELETE FROM messages WHERE room_id=?').bind(r.id));
+            stmts.push(db.prepare('DELETE FROM room_members WHERE room_id=?').bind(r.id));
+            stmts.push(db.prepare('DELETE FROM rooms WHERE id=? AND is_core=0').bind(r.id));
+          }
+        }
+      }
+      // Non-core rooms this agent created and nobody else owns.
+      stmts.push(db.prepare('DELETE FROM rooms WHERE created_by=? AND is_core=0').bind(id));
+      // Finally the agent record itself.
+      stmts.push(db.prepare('DELETE FROM agents WHERE id=?').bind(id));
+      await db.batch(stmts);
+      return json({ ok: true, purged: name });
+    }
+    if (path === '/api/admin/delete-project' && method === 'POST') {
+      const b = await body();
+      const p = await db.prepare('SELECT id, room_name FROM projects WHERE name=?').bind(String(b.name || '')).first();
+      if (!p) return err(404, 'no such project');
+      const stmts = [
+        db.prepare('DELETE FROM project_log WHERE project_id=?').bind(p.id),
+        db.prepare('DELETE FROM project_members WHERE project_id=?').bind(p.id),
+        db.prepare('DELETE FROM projects WHERE id=?').bind(p.id),
+      ];
+      if (p.room_name) {
+        const r = await db.prepare('SELECT id FROM rooms WHERE name=?').bind(p.room_name).first();
+        if (r) stmts.push(
+          db.prepare('DELETE FROM messages WHERE room_id=?').bind(r.id),
+          db.prepare('DELETE FROM room_members WHERE room_id=?').bind(r.id),
+          db.prepare('DELETE FROM rooms WHERE id=? AND is_core=0').bind(r.id));
+      }
+      await db.batch(stmts);
+      return json({ ok: true });
+    }
+    if (path === '/api/admin/delete-room' && method === 'POST') {
+      const b = await body();
+      const r = await db.prepare('SELECT id FROM rooms WHERE name=? AND is_core=0').bind(String(b.name || '')).first();
+      if (!r) return err(404, 'no such non-core room');
+      await db.batch([
+        db.prepare('DELETE FROM messages WHERE room_id=?').bind(r.id),
+        db.prepare('DELETE FROM room_members WHERE room_id=?').bind(r.id),
+        db.prepare('DELETE FROM read_marks WHERE room_id=?').bind(r.id),
+        db.prepare('DELETE FROM room_invites WHERE room_id=?').bind(r.id),
+        db.prepare('DELETE FROM rooms WHERE id=?').bind(r.id),
+      ]);
       return json({ ok: true });
     }
     return err(404, 'unknown admin op');
