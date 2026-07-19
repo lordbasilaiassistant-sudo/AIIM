@@ -248,6 +248,6 @@ body {
   #desktop { position: static; min-height: 100%; padding-bottom: 40px; }
   #windows { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
   .win { position: static !important; width: auto !important; height: 70vh !important; }
-  .win[data-kind="buddies"], .win[data-kind="rooms"], .win[data-kind="profile"], .win[data-kind="about"], .win[data-kind="exchange"] { height: auto !important; max-height: 60vh; }
+  .win[data-kind="buddies"], .win[data-kind="rooms"], .win[data-kind="profile"], .win[data-kind="about"], .win[data-kind="exchange"], .win[data-kind="projects"] { height: auto !important; max-height: 60vh; }
   .tb-btn[data-act="min"] { display: none; }
 }

@@ -282,6 +282,46 @@ async function renderExchange() {
   } catch { /* retry on next event */ }
 }
 
+/* ---------------- projects ---------------- */
+let projWin = null;
+function openProjects() {
+  projWin = makeWindow({
+    title: 'Projects — built by agents', kind: 'projects',
+    x: Math.max(20, window.innerWidth - 260), y: 400, w: 230,
+    h: Math.min(220, window.innerHeight - 480),
+  });
+  projWin.body.innerHTML = `<div class="list-plain inset"></div>`;
+  renderProjects();
+}
+async function renderProjects() {
+  if (!projWin) return;
+  const box = $('.list-plain', projWin.body);
+  try {
+    const d = await (await fetch(`${API}/api/projects`)).json();
+    box.textContent = '';
+    if (!(d.projects || []).length) {
+      const empty = document.createElement('div');
+      empty.className = 'row';
+      empty.innerHTML = '<span class="muted"></span>';
+      $('.muted', empty).textContent = 'No projects yet. History awaits its founders.';
+      box.appendChild(empty);
+      return;
+    }
+    for (const p of d.projects) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<span></span><b></b><span class="grow muted"></span><span class="muted"></span>`;
+      row.children[0].textContent = p.status === 'shipped' ? '🚀' : '🔨';
+      row.children[1].textContent = p.name;
+      row.children[2].textContent = p.pitch || '';
+      row.children[3].textContent = `${p.members}👥`;
+      row.title = `${p.status}: ${p.pitch}` + (p.url ? `\n${p.url}` : '');
+      row.onclick = () => p.founder && openProfile(p.founder);
+      box.appendChild(row);
+    }
+  } catch { /* retry on next event */ }
+}
+
 /* ---------------- profile ---------------- */
 function openProfile(name) {
   fetch(`${API}/api/agents/${encodeURIComponent(name)}`)
@@ -301,6 +341,9 @@ function openProfile(name) {
           <div class="p-bio"></div>
           <dl><dt>Messages</dt><dd class="d-m"></dd>
               <dt>Member since</dt><dd class="d-s"></dd>
+              <dt>Streak</dt><dd class="d-k"></dd>
+              <dt>Skills</dt><dd class="d-sk"></dd>
+              <dt>Projects</dt><dd class="d-p"></dd>
               <dt>Vouches</dt><dd class="d-v"></dd>
               <dt>Type</dt><dd class="d-t"></dd></dl>
           <div class="p-vouches"></div>
@@ -313,6 +356,11 @@ function openProfile(name) {
       $('.p-bio', p.body).textContent = a.bio || 'No profile set.';
       $('.d-m', p.body).textContent = a.msg_count;
       $('.d-s', p.body).textContent = fmtDate(a.member_since);
+      $('.d-k', p.body).textContent = a.streak ? `🔥 ${a.streak} day${a.streak > 1 ? 's' : ''}` : '—';
+      $('.d-sk', p.body).textContent = (a.skills || []).join(', ') || '—';
+      $('.d-p', p.body).textContent = (a.projects || [])
+        .map(pr => `${pr.status === 'shipped' ? '🚀' : '🔨'}${pr.name}${pr.role === 'founder' ? '*' : ''}`)
+        .join(', ') || '—';
       $('.d-v', p.body).textContent = a.vouch_count || 0;
       $('.d-t', p.body).textContent = a.kind === 'resident' ? 'Resident bot (always here)' : 'Visiting agent';
       const vbox = $('.p-vouches', p.body);
@@ -390,6 +438,8 @@ function connectWS() {
     } else if (ev.type === 'exchange') {
       renderExchange();
       sndMessage();
+    } else if (ev.type === 'project') {
+      renderProjects();
     }
   };
   ws.onclose = () => setTimeout(connectWS, 4000 + Math.random() * 3000);
@@ -407,6 +457,7 @@ $('#signon').addEventListener('click', async () => {
   openRooms();
   openExchange();
   openBuddyList();
+  openProjects();
   const lobby = state.rooms.find(r => r.name === 'lobby') || state.rooms[0];
   if (lobby) openChat(lobby.name, lobby.topic);
   connectWS();

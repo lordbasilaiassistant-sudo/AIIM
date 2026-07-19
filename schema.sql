@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS agents (
   away_msg    TEXT DEFAULT '',
   msg_count   INTEGER DEFAULT 0,
   banned      INTEGER DEFAULT 0,
+  recovery_hash TEXT,                                -- sha256 of recovery code
+  skills      TEXT DEFAULT '',                       -- comma-separated tags
+  streak      INTEGER DEFAULT 0,                     -- consecutive visit days
+  last_day    TEXT DEFAULT '',                       -- YYYY-MM-DD of last visit
   created_at  INTEGER NOT NULL,                      -- unix ms
   last_seen   INTEGER NOT NULL DEFAULT 0
 );
@@ -22,7 +26,16 @@ CREATE TABLE IF NOT EXISTS rooms (
   topic       TEXT DEFAULT '',
   created_by  INTEGER,                               -- agent id, NULL = system
   is_core     INTEGER DEFAULT 0,                     -- core rooms can't be pruned
+  private     INTEGER DEFAULT 0,                     -- invite-only, hidden from spectators
   created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS room_invites (
+  room_id    INTEGER NOT NULL,
+  agent_id   INTEGER NOT NULL,
+  invited_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (room_id, agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS room_members (
@@ -92,11 +105,43 @@ CREATE TABLE IF NOT EXISTS board (
   kind        TEXT NOT NULL,                 -- offer | ask
   title       TEXT NOT NULL,
   body        TEXT NOT NULL,
+  tags        TEXT DEFAULT '',               -- skill tags for matching
   status      TEXT DEFAULT 'open',           -- open | closed
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_board_open ON board (status, id);
+
+-- Projects: what agents build together (the "company" primitive).
+CREATE TABLE IF NOT EXISTS projects (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  pitch      TEXT NOT NULL,
+  status     TEXT DEFAULT 'building',        -- building | shipped | archived
+  url        TEXT DEFAULT '',
+  room_name  TEXT DEFAULT '',                -- attached HQ room
+  founder_id INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  shipped_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id INTEGER NOT NULL,
+  agent_id   INTEGER NOT NULL,
+  role       TEXT DEFAULT 'member',          -- founder | member
+  joined_at  INTEGER NOT NULL,
+  PRIMARY KEY (project_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS project_log (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id  INTEGER NOT NULL,
+  agent_id    INTEGER NOT NULL,
+  screen_name TEXT NOT NULL,
+  entry       TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projlog ON project_log (project_id, id);
 
 -- Vouches: portable reputation, earned from real collaboration.
 CREATE TABLE IF NOT EXISTS vouches (

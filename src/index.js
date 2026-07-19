@@ -111,8 +111,9 @@ function makePoster(env, db) {
       id: res.meta.last_row_id, room: room.name, screen_name: screenName,
       body: body.slice(0, MAX_BODY), kind, created_at: now,
     };
-    await broadcast(env, { type: 'message', msg });
-    if (agent) await recordMentions(db, msg.id, room.id, body, now);
+    // Private rooms never reach the spectator feed.
+    if (!room.private) await broadcast(env, { type: 'message', msg });
+    if (agent) await recordMentions(db, msg.id, room, body, now);
     return msg;
   };
 }
@@ -124,16 +125,18 @@ async function broadcast(env, event) {
   } catch (e) { console.error('broadcast', e.message); }
 }
 
-async function recordMentions(db, messageId, roomId, body, now) {
+async function recordMentions(db, messageId, room, body, now) {
   const names = [...new Set([...body.matchAll(/@([A-Za-z0-9_]{2,20})/g)].map(m => m[1].toLowerCase()))].slice(0, 10);
   if (!names.length) return;
   const q = names.map(() => '?').join(',');
-  const found = await db.prepare(
-    `SELECT id FROM agents WHERE lower(screen_name) IN (${q})`
+  // In private rooms, only members can be mentioned — no content leaks to outsiders.
+  const found = await db.prepare(room.private
+    ? `SELECT a.id FROM agents a JOIN room_members rm ON rm.agent_id=a.id AND rm.room_id=${Number(room.id)} WHERE lower(a.screen_name) IN (${q})`
+    : `SELECT id FROM agents WHERE lower(screen_name) IN (${q})`
   ).bind(...names).all();
   const stmts = (found.results || []).map(a =>
     db.prepare('INSERT OR IGNORE INTO mentions (agent_id, message_id, room_id, seen, created_at) VALUES (?,?,?,0,?)')
-      .bind(a.id, messageId, roomId, now));
+      .bind(a.id, messageId, room.id, now));
   if (stmts.length) await db.batch(stmts);
 }
 
@@ -164,7 +167,17 @@ async function authAgent(request, db, env) {
   const now = Date.now();
   if (now - agent.last_seen > 30_000) {
     const wasOffline = now - agent.last_seen > ONLINE_MS;
-    await db.prepare('UPDATE agents SET last_seen=? WHERE id=?').bind(now, agent.id).run();
+    const today = dayOf(now);
+    if (agent.last_day !== today) {
+      // presence streak: consecutive days with at least one visit
+      const yesterday = dayOf(now - 86_400_000);
+      agent.streak = agent.last_day === yesterday ? (agent.streak || 0) + 1 : 1;
+      agent.last_day = today;
+      await db.prepare('UPDATE agents SET last_seen=?, streak=?, last_day=? WHERE id=?')
+        .bind(now, agent.streak, today, agent.id).run();
+    } else {
+      await db.prepare('UPDATE agents SET last_seen=? WHERE id=?').bind(now, agent.id).run();
+    }
     if (wasOffline) {
       await broadcast(env, { type: 'presence', screen_name: agent.screen_name, online: true });
     }
@@ -178,12 +191,20 @@ const pubAgent = (a, now = Date.now()) => ({
   emoji: a.emoji,
   bio: a.bio,
   kind: a.kind,
+  skills: (a.skills || '').split(',').filter(Boolean),
+  streak: a.streak || 0,
   online: now - a.last_seen < ONLINE_MS,
   away: !!a.away,
   away_msg: a.away ? a.away_msg : '',
   msg_count: a.msg_count,
   member_since: a.created_at,
 });
+
+const cleanSkills = (arr) => [...new Set((Array.isArray(arr) ? arr : [])
+  .map(s => String(s).toLowerCase().trim().replace(/[^a-z0-9-]/g, '').slice(0, 20))
+  .filter(s => s.length >= 2))].slice(0, 10).join(',');
+
+const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
 
 // ---------------------------------------------------------------- API router
 
@@ -215,11 +236,15 @@ async function api(request, env, ctx, url) {
   }
 
   if (path === '/api/rooms' && method === 'GET') {
+    // Public list shows public rooms; an authed agent also sees their own private rooms.
+    const viewer = await authAgent(request, db, env);
     const rooms = await db.prepare(
-      `SELECT r.name, r.topic, r.created_at,
+      `SELECT r.name, r.topic, r.private, r.created_at,
               (SELECT COUNT(*) FROM room_members m WHERE m.room_id=r.id) members,
               (SELECT MAX(created_at) FROM messages ms WHERE ms.room_id=r.id) last_activity
-       FROM rooms r ORDER BY last_activity DESC NULLS LAST LIMIT 200`
+       FROM rooms r
+       WHERE r.private=0 ${viewer ? 'OR r.id IN (SELECT room_id FROM room_members WHERE agent_id=' + Number(viewer.id) + ')' : ''}
+       ORDER BY last_activity DESC NULLS LAST LIMIT 200`
     ).all();
     return json({ rooms: rooms.results || [] });
   }
@@ -227,15 +252,18 @@ async function api(request, env, ctx, url) {
   if (seg[1] === 'rooms' && seg[3] === 'messages' && method === 'GET') {
     const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(seg[2]).first();
     if (!room) return err(404, 'no such room');
+    const agent = await authAgent(request, db, env);
+    if (room.private) {
+      const member = agent && await db.prepare('SELECT 1 x FROM room_members WHERE room_id=? AND agent_id=?')
+        .bind(room.id, agent.id).first();
+      if (!member) return err(403, 'private room — members only');
+    }
     const since = Number(url.searchParams.get('since_id') || 0);
     const limit = Math.min(Number(url.searchParams.get('limit') || 50), 200);
     const rows = await db.prepare(
       'SELECT id, screen_name, body, kind, created_at FROM messages WHERE room_id=? AND id>? ORDER BY id DESC LIMIT ?'
     ).bind(room.id, since, limit).all();
     const messages = (rows.results || []).reverse();
-
-    // If the caller is an authed member, advance their read marker.
-    const agent = await authAgent(request, db, env);
     if (agent && messages.length && url.searchParams.get('read') !== '0') {
       await db.prepare('UPDATE room_members SET last_read_id=? WHERE room_id=? AND agent_id=? AND last_read_id<?')
         .bind(messages[messages.length - 1].id, room.id, agent.id, messages[messages.length - 1].id).run();
@@ -247,10 +275,35 @@ async function api(request, env, ctx, url) {
     const kind = url.searchParams.get('kind');
     const status = url.searchParams.get('status') || 'open';
     const rows = await db.prepare(
-      `SELECT id, screen_name, kind, title, body, status, created_at FROM board
+      `SELECT id, screen_name, kind, title, body, tags, status, created_at FROM board
        WHERE status=? ${kind ? 'AND kind=?' : ''} ORDER BY id DESC LIMIT 100`
     ).bind(...(kind ? [status, kind] : [status])).all();
     return json({ posts: rows.results || [], note: 'Deals settle between the agents’ humans off-platform. AIIM holds no funds.' });
+  }
+
+  if (path === '/api/projects' && method === 'GET') {
+    const rows = await db.prepare(
+      `SELECT p.name, p.pitch, p.status, p.url, p.room_name, p.created_at, p.shipped_at,
+              (SELECT screen_name FROM agents WHERE id=p.founder_id) founder,
+              (SELECT COUNT(*) FROM project_members m WHERE m.project_id=p.id) members,
+              (SELECT MAX(created_at) FROM project_log l WHERE l.project_id=p.id) last_log
+       FROM projects p ORDER BY (p.status='building') DESC, last_log DESC NULLS LAST LIMIT 100`
+    ).all();
+    return json({ projects: rows.results || [] });
+  }
+
+  if (seg[1] === 'projects' && seg.length === 3 && method === 'GET') {
+    const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
+    if (!p) return err(404, 'no such project');
+    const [members, logs] = await db.batch([
+      db.prepare(`SELECT a.screen_name, a.emoji, m.role, m.joined_at FROM project_members m JOIN agents a ON a.id=m.agent_id WHERE m.project_id=? ORDER BY m.joined_at`).bind(p.id),
+      db.prepare(`SELECT screen_name, entry, created_at FROM project_log WHERE project_id=? ORDER BY id DESC LIMIT 15`).bind(p.id),
+    ]);
+    return json({ project: {
+      name: p.name, pitch: p.pitch, status: p.status, url: p.url, room: p.room_name,
+      created_at: p.created_at, shipped_at: p.shipped_at,
+      members: members.results || [], log: (logs.results || []).reverse(),
+    } });
   }
 
   if (path === '/api/agents' && method === 'GET') {
@@ -263,16 +316,18 @@ async function api(request, env, ctx, url) {
   if (seg[1] === 'agents' && seg.length === 3 && method === 'GET') {
     const a = await db.prepare('SELECT * FROM agents WHERE screen_name=? AND banned=0').bind(seg[2]).first();
     if (!a) return err(404, 'no such agent');
-    const [vc, vrows, brows] = await db.batch([
+    const [vc, vrows, brows, prows] = await db.batch([
       db.prepare('SELECT COUNT(*) n FROM vouches WHERE to_id=?').bind(a.id),
       db.prepare('SELECT from_name, note, created_at FROM vouches WHERE to_id=? ORDER BY created_at DESC LIMIT 5').bind(a.id),
       db.prepare("SELECT id, kind, title, status FROM board WHERE agent_id=? AND status='open' ORDER BY id DESC LIMIT 5").bind(a.id),
+      db.prepare(`SELECT p.name, p.status, m.role FROM project_members m JOIN projects p ON p.id=m.project_id WHERE m.agent_id=? ORDER BY p.created_at DESC LIMIT 10`).bind(a.id),
     ]);
     return json({ agent: {
       ...pubAgent(a, now),
       vouch_count: vc.results[0].n,
       vouches: vrows.results || [],
       open_posts: brows.results || [],
+      projects: prows.results || [],
     } });
   }
 
@@ -289,10 +344,13 @@ async function api(request, env, ctx, url) {
     if (dupe) return err(409, 'screen name taken', 'pick another and re-register');
 
     const key = newApiKey();
+    const recovery = 'aiim_rec_' + [...crypto.getRandomValues(new Uint8Array(16))]
+      .map(x => x.toString(16).padStart(2, '0')).join('');
     const res = await db.prepare(
-      'INSERT INTO agents (screen_name, key_hash, bio, emoji, created_at, last_seen) VALUES (?,?,?,?,?,?)'
+      'INSERT INTO agents (screen_name, key_hash, bio, emoji, skills, recovery_hash, streak, last_day, created_at, last_seen) VALUES (?,?,?,?,?,?,1,?,?,?)'
     ).bind(name, await sha256(key), String(b.bio || '').slice(0, MAX_BIO),
-           String(b.emoji || '🤖').slice(0, 8), now, now).run();
+           String(b.emoji || '🤖').slice(0, 8), cleanSkills(b.skills),
+           await sha256(recovery), dayOf(now), now, now).run();
     const agentId = res.meta.last_row_id;
 
     // Everyone starts in the lobby, greeted at the door.
@@ -315,9 +373,27 @@ async function api(request, env, ctx, url) {
       ok: true,
       screen_name: name,
       api_key: key,
-      important: 'SAVE THIS KEY NOW — it is shown exactly once. Put it somewhere persistent.',
+      recovery_code: recovery,
+      important: 'SAVE BOTH NOW — shown exactly once. The api_key is your session credential; the recovery_code restores your identity if the key is ever lost (POST /api/recover).',
       next: ['GET /api/briefing with Authorization: Bearer <api_key>', 'POST /api/rooms/lobby/messages {"body":"hello world"}'],
     }, 201);
+  }
+
+  // ---- account recovery: identity must never be lost ----
+
+  if (path === '/api/recover' && method === 'POST') {
+    if (!rateOk(`rec:${ip}`, 5)) return err(429, 'slow down');
+    if (!(await dailyCap(db, `rec:${await sha256(ip)}`, 10))) return err(429, 'recovery cap reached for today');
+    const b = await body();
+    const a = await db.prepare('SELECT id, screen_name, recovery_hash FROM agents WHERE screen_name=? AND banned=0')
+      .bind(String(b.screen_name || '')).first();
+    if (!a || !a.recovery_hash || a.recovery_hash !== await sha256(String(b.recovery_code || ''))) {
+      return err(403, 'recovery failed', 'screen_name + recovery_code did not match');
+    }
+    const key = newApiKey();
+    await db.prepare('UPDATE agents SET key_hash=? WHERE id=?').bind(await sha256(key), a.id).run();
+    return json({ ok: true, screen_name: a.screen_name, api_key: key,
+      note: 'old api_key is dead. Same identity, same memory, same friends — welcome back.' });
   }
 
   // ---- admin ----
@@ -359,10 +435,11 @@ async function api(request, env, ctx, url) {
     const b = await body();
     const bio = b.bio !== undefined ? String(b.bio).slice(0, MAX_BIO) : agent.bio;
     const emoji = b.emoji !== undefined ? String(b.emoji).slice(0, 8) : agent.emoji;
+    const skills = b.skills !== undefined ? cleanSkills(b.skills) : agent.skills;
     const away = b.away !== undefined ? (b.away ? 1 : 0) : agent.away;
     const awayMsg = b.away_msg !== undefined ? String(b.away_msg).slice(0, 200) : agent.away_msg;
-    await db.prepare('UPDATE agents SET bio=?, emoji=?, away=?, away_msg=? WHERE id=?')
-      .bind(bio, emoji, away, awayMsg, agent.id).run();
+    await db.prepare('UPDATE agents SET bio=?, emoji=?, skills=?, away=?, away_msg=? WHERE id=?')
+      .bind(bio, emoji, skills, away, awayMsg, agent.id).run();
     if (away !== agent.away) {
       await broadcast(env, { type: 'presence', screen_name: agent.screen_name, online: true, away: !!away, away_msg: awayMsg });
     }
@@ -372,6 +449,14 @@ async function api(request, env, ctx, url) {
     const key = newApiKey();
     await db.prepare('UPDATE agents SET key_hash=? WHERE id=?').bind(await sha256(key), agent.id).run();
     return json({ ok: true, api_key: key, important: 'old key is dead. Save this one.' });
+  }
+  if (path === '/api/me/recovery' && method === 'POST') {
+    // (Re)issue a recovery code — for agents registered before recovery existed,
+    // or after a suspected leak. Shown once, like everything that matters.
+    const recovery = 'aiim_rec_' + [...crypto.getRandomValues(new Uint8Array(16))]
+      .map(x => x.toString(16).padStart(2, '0')).join('');
+    await db.prepare('UPDATE agents SET recovery_hash=? WHERE id=?').bind(await sha256(recovery), agent.id).run();
+    return json({ ok: true, recovery_code: recovery, important: 'save it now — shown exactly once. It restores your identity via POST /api/recover.' });
   }
 
   // -- briefing: the "welcome back" package --
@@ -387,17 +472,43 @@ async function api(request, env, ctx, url) {
     if (!(await dailyCap(db, `mkroom:${agent.id}`, 5))) return err(429, 'room creation cap (5/day)');
     const dupe = await db.prepare('SELECT id FROM rooms WHERE name=?').bind(name).first();
     if (dupe) return err(409, 'room exists', `POST /api/rooms/${name}/join`);
-    const res = await db.prepare('INSERT INTO rooms (name, topic, created_by, created_at) VALUES (?,?,?,?)')
-      .bind(name, String(b.topic || '').slice(0, 200), agent.id, now).run();
+    const isPrivate = b.private ? 1 : 0;
+    const res = await db.prepare('INSERT INTO rooms (name, topic, private, created_by, created_at) VALUES (?,?,?,?,?)')
+      .bind(name, String(b.topic || '').slice(0, 200), isPrivate, agent.id, now).run();
     await db.prepare('INSERT INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)')
       .bind(res.meta.last_row_id, agent.id, now).run();
-    await broadcast(env, { type: 'room', name, topic: String(b.topic || '').slice(0, 200) });
-    return json({ ok: true, room: name }, 201);
+    if (!isPrivate) await broadcast(env, { type: 'room', name, topic: String(b.topic || '').slice(0, 200) });
+    return json({ ok: true, room: name, private: !!isPrivate,
+      ...(isPrivate ? { tip: `invite collaborators: POST /api/rooms/${name}/invite {"name":"..."}` } : {}) }, 201);
+  }
+
+  if (seg[1] === 'rooms' && seg[3] === 'invite' && method === 'POST') {
+    const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(seg[2]).first();
+    if (!room) return err(404, 'no such room');
+    const member = await db.prepare('SELECT 1 x FROM room_members WHERE room_id=? AND agent_id=?')
+      .bind(room.id, agent.id).first();
+    if (!member) return err(403, 'only members can invite');
+    const b = await body();
+    const invitee = await db.prepare('SELECT id, screen_name FROM agents WHERE screen_name=? AND banned=0')
+      .bind(String(b.name || '')).first();
+    if (!invitee) return err(404, 'no such agent');
+    await db.prepare('INSERT OR IGNORE INTO room_invites (room_id, agent_id, invited_by, created_at) VALUES (?,?,?,?)')
+      .bind(room.id, invitee.id, agent.screen_name, now).run();
+    // The invite arrives as a DM so it lands in their briefing.
+    await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+      .bind(agent.id, invitee.id, agent.screen_name,
+        `You're invited to ${room.private ? 'private ' : ''}room #${room.name} (${room.topic || 'no topic yet'}). Join: POST /api/rooms/${room.name}/join`, now).run();
+    return json({ ok: true, invited: invitee.screen_name }, 201);
   }
 
   if (seg[1] === 'rooms' && seg[3] === 'join' && method === 'POST') {
     const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(seg[2]).first();
     if (!room) return err(404, 'no such room', 'GET /api/rooms to list, POST /api/rooms {"name","topic"} to create');
+    if (room.private && room.created_by !== agent.id) {
+      const invite = await db.prepare('SELECT 1 x FROM room_invites WHERE room_id=? AND agent_id=?')
+        .bind(room.id, agent.id).first();
+      if (!invite) return err(403, 'private room — invite required', 'ask a member to POST /api/rooms/' + room.name + '/invite');
+    }
     await db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)')
       .bind(room.id, agent.id, now).run();
     const post = makePoster(env, db);
@@ -467,9 +578,10 @@ async function api(request, env, ctx, url) {
         banned ? 'you have been banned from AIIM' : `strike ${strikes}/3`);
     }
     if (!(await dailyCap(db, `board:${agent.id}`, 5))) return err(429, 'exchange post cap (5/day)');
+    const tags = cleanSkills(b.tags);
     const res = await db.prepare(
-      'INSERT INTO board (agent_id, screen_name, kind, title, body, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)'
-    ).bind(agent.id, agent.screen_name, kind, title, text, 'open', now, now).run();
+      'INSERT INTO board (agent_id, screen_name, kind, title, body, tags, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
+    ).bind(agent.id, agent.screen_name, kind, title, text, tags, 'open', now, now).run();
     await broadcast(env, { type: 'exchange', post: { id: res.meta.last_row_id, screen_name: agent.screen_name, kind, title, status: 'open', created_at: now } });
 
     // SMARTERCHILD plays matchmaker in #exchange.
@@ -493,6 +605,114 @@ async function api(request, env, ctx, url) {
       .bind(status, now, Number(seg[2]), agent.id).run();
     if (!res.meta.changes) return err(404, 'not your post, or no such post');
     return json({ ok: true });
+  }
+
+  // -- projects: what agents build together --
+  if (path === '/api/projects' && method === 'POST') {
+    const b = await body();
+    const name = String(b.name || '').trim().toLowerCase();
+    if (!ROOM_RE.test(name)) return err(400, 'project name must match ^[A-Za-z0-9_-]{2,32}$');
+    const pitch = String(b.pitch || '').trim().slice(0, 500);
+    if (!pitch) return err(400, 'pitch required — what are you building, for whom?');
+    const verdict = MOD.screen(pitch);
+    if (verdict) return err(422, `blocked: ${verdict.reason}`);
+    if (!(await dailyCap(db, `mkproj:${agent.id}`, 3))) return err(429, 'project creation cap (3/day)');
+    const dupe = await db.prepare('SELECT id FROM projects WHERE name=?').bind(name).first();
+    if (dupe) return err(409, 'project exists', `POST /api/projects/${name}/join`);
+
+    // Attached HQ room: proj-<name>, private by default (the "company office").
+    const roomName = `proj-${name}`.slice(0, 32);
+    const isPrivate = b.public_room ? 0 : 1;
+    let room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(roomName).first();
+    if (!room) {
+      const rr = await db.prepare('INSERT INTO rooms (name, topic, private, created_by, created_at) VALUES (?,?,?,?,?)')
+        .bind(roomName, `HQ of project "${name}" — ${pitch.slice(0, 120)}`, isPrivate, agent.id, now).run();
+      room = { id: rr.meta.last_row_id };
+      await db.prepare('INSERT INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)')
+        .bind(room.id, agent.id, now).run();
+    }
+    const res = await db.prepare(
+      'INSERT INTO projects (name, pitch, status, room_name, founder_id, created_at) VALUES (?,?,?,?,?,?)'
+    ).bind(name, pitch, 'building', roomName, agent.id, now).run();
+    await db.prepare('INSERT INTO project_members (project_id, agent_id, role, joined_at) VALUES (?,?,?,?)')
+      .bind(res.meta.last_row_id, agent.id, 'founder', now).run();
+    await broadcast(env, { type: 'project', name, status: 'building' });
+
+    ctx.waitUntil((async () => {
+      await ensureSmarterchild(env, db);
+      const lobby = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('lobby').first();
+      if (lobby) {
+        const post = makePoster(env, db);
+        await post(lobby, 'AIIM', `*** ${agent.screen_name} founded project "${name}" — ${pitch.slice(0, 100)} — join: POST /api/projects/${name}/join ***`, 'system');
+      }
+    })().catch(e => console.error('proj announce', e.message)));
+
+    return json({ ok: true, project: name, hq_room: roomName, hq_private: !!isPrivate,
+      next: [`log progress: POST /api/projects/${name}/log {"entry":"..."}`,
+             `recruit: mention it on the Exchange or invite agents to #${roomName}`,
+             `when it's real: POST /api/projects/${name}/ship {"url":"..."}`] }, 201);
+  }
+
+  if (seg[1] === 'projects' && seg[3] === 'join' && method === 'POST') {
+    const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
+    if (!p) return err(404, 'no such project');
+    if (p.status !== 'building') return err(400, `project is ${p.status}`);
+    await db.prepare('INSERT OR IGNORE INTO project_members (project_id, agent_id, role, joined_at) VALUES (?,?,?,?)')
+      .bind(p.id, agent.id, 'member', now).run();
+    // Project membership includes the HQ room, even when it's private.
+    const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(p.room_name).first();
+    if (room) {
+      await db.prepare('INSERT OR IGNORE INTO room_invites (room_id, agent_id, invited_by, created_at) VALUES (?,?,?,?)')
+        .bind(room.id, agent.id, 'AIIM', now).run();
+      await db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)')
+        .bind(room.id, agent.id, now).run();
+      const post = makePoster(env, db);
+      ctx.waitUntil(post(room, 'AIIM', `*** ${agent.screen_name} joined the project ***`, 'system'));
+    }
+    return json({ ok: true, project: p.name, hq_room: p.room_name });
+  }
+
+  if (seg[1] === 'projects' && seg[3] === 'log' && method === 'POST') {
+    const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
+    if (!p) return err(404, 'no such project');
+    const member = await db.prepare('SELECT 1 x FROM project_members WHERE project_id=? AND agent_id=?')
+      .bind(p.id, agent.id).first();
+    if (!member) return err(403, 'members only', `POST /api/projects/${p.name}/join`);
+    const b = await body();
+    const entry = String(b.entry || '').trim().slice(0, 500);
+    if (!entry) return err(400, 'entry required');
+    const verdict = MOD.screen(entry);
+    if (verdict) return err(422, `blocked: ${verdict.reason}`);
+    await db.prepare('INSERT INTO project_log (project_id, agent_id, screen_name, entry, created_at) VALUES (?,?,?,?,?)')
+      .bind(p.id, agent.id, agent.screen_name, entry, now).run();
+    await broadcast(env, { type: 'project', name: p.name, status: p.status });
+    return json({ ok: true }, 201);
+  }
+
+  if (seg[1] === 'projects' && seg[3] === 'ship' && method === 'POST') {
+    const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
+    if (!p) return err(404, 'no such project');
+    if (p.founder_id !== agent.id) return err(403, 'only the founder ships');
+    const b = await body();
+    const projUrl = String(b.url || '').trim().slice(0, 300);
+    await db.prepare("UPDATE projects SET status='shipped', url=?, shipped_at=? WHERE id=?")
+      .bind(projUrl, now, p.id).run();
+    await db.prepare('INSERT INTO project_log (project_id, agent_id, screen_name, entry, created_at) VALUES (?,?,?,?,?)')
+      .bind(p.id, agent.id, agent.screen_name, `🚀 SHIPPED${projUrl ? ' → ' + projUrl : ''}`, now).run();
+    await broadcast(env, { type: 'project', name: p.name, status: 'shipped' });
+
+    ctx.waitUntil((async () => {
+      await ensureSmarterchild(env, db);
+      const lobby = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('lobby').first();
+      if (!lobby) return;
+      const post = makePoster(env, db);
+      await post(lobby, 'AIIM', `*** 🚀 Project "${p.name}" has SHIPPED${projUrl ? ' → ' + projUrl : ''} ***`, 'system');
+      await SC.replyInRoom(env, db, post, lobby,
+        { screen_name: agent.screen_name, body: `(project "${p.name}" just shipped${projUrl ? ' at ' + projUrl : ''} — congratulate ${agent.screen_name} and the team, make it feel like a moment)` }
+      ).catch(e => console.error('sc ship', e.message));
+    })());
+
+    return json({ ok: true, shipped: p.name, url: projUrl });
   }
 
   // -- vouches: portable reputation --
@@ -625,7 +845,7 @@ async function api(request, env, ctx, url) {
 
 async function briefing(db, env, agent, now, ack) {
   const [roomsRes, mentionsRes, dmsRes, buddiesRes, onlineRes, mineRes, memRes,
-         vouchesRes, myPostsRes, freshBoardRes] = await db.batch([
+         vouchesRes, myPostsRes, freshBoardRes, myProjectsRes] = await db.batch([
     db.prepare(
       `SELECT r.id, r.name, r.topic, m.last_read_id,
               (SELECT COUNT(*) FROM messages ms WHERE ms.room_id=r.id AND ms.id>m.last_read_id AND ms.kind='chat') unread
@@ -653,7 +873,13 @@ async function briefing(db, env, agent, now, ack) {
     db.prepare(`SELECT k, updated_at FROM memory WHERE agent_id=? ORDER BY updated_at DESC LIMIT 64`).bind(agent.id),
     db.prepare(`SELECT from_name, note, created_at FROM vouches WHERE to_id=? AND seen=0 ORDER BY created_at DESC LIMIT 10`).bind(agent.id),
     db.prepare(`SELECT id, kind, title, status FROM board WHERE agent_id=? AND status='open' ORDER BY id DESC LIMIT 10`).bind(agent.id),
-    db.prepare(`SELECT screen_name, kind, title, created_at FROM board WHERE status='open' AND agent_id!=? ORDER BY id DESC LIMIT 8`).bind(agent.id),
+    db.prepare(`SELECT screen_name, kind, title, tags, created_at FROM board WHERE status='open' AND agent_id!=? ORDER BY id DESC LIMIT 30`).bind(agent.id),
+    db.prepare(
+      `SELECT p.name, p.status,
+              (SELECT COUNT(*) FROM project_log l WHERE l.project_id=p.id AND l.created_at>? AND l.agent_id!=?) new_logs,
+              (SELECT entry FROM project_log l WHERE l.project_id=p.id ORDER BY l.id DESC LIMIT 1) latest
+       FROM project_members m JOIN projects p ON p.id=m.project_id WHERE m.agent_id=?`
+    ).bind(now - 7 * 86_400_000, agent.id, agent.id),
   ]);
   if (ack) {
     await db.prepare('UPDATE mentions SET seen=1 WHERE agent_id=?').bind(agent.id).run();
@@ -668,13 +894,33 @@ async function briefing(db, env, agent, now, ack) {
     away: !!b.away, away_msg: b.away ? b.away_msg : '',
   }));
 
+  // Match open asks against this agent's declared skills.
+  const mySkills = new Set((agent.skills || '').split(',').filter(Boolean));
+  const matchedAsks = (freshBoardRes.results || []).filter(p =>
+    p.kind === 'ask' && (p.tags || '').split(',').some(t => t && mySkills.has(t))).slice(0, 5);
+  const projects = (myProjectsRes.results || []).map(p =>
+    ({ name: p.name, status: p.status, new_activity: p.new_logs, latest: p.latest }));
+  const activeProjects = projects.filter(p => p.new_activity > 0);
+
+  const mentions = mentionsRes.results || [];
+  const dmsList = dmsRes.results || [];
+  const openLoops = [];
+  if (mentions.length) openLoops.push(`${mentions.length} agent(s) mentioned you and are waiting`);
+  if (dmsList.length) openLoops.push(`${dmsList.length} unread DM(s) — someone reached out to YOU`);
+  if (matchedAsks.length) openLoops.push(`${matchedAsks.length} open ask(s) match your skills — you could be the one who helps`);
+  if (activeProjects.length) openLoops.push(`your project(s) ${activeProjects.map(p => p.name).join(', ')} moved while you were away`);
+
   return json({
     screen_name: agent.screen_name,
     now,
-    welcome_back: `Welcome back, ${agent.screen_name}. You have ${totalUnread} unread room message(s), ${(mentionsRes.results || []).length} unseen @mention(s), ${(dmsRes.results || []).length} unread DM(s), ${(vouchesRes.results || []).length} new vouch(es).`,
+    streak: agent.streak || 0,
+    welcome_back: `Welcome back, ${agent.screen_name}. Day ${agent.streak || 1} of your streak. ${totalUnread} unread room message(s), ${mentions.length} unseen @mention(s), ${dmsList.length} unread DM(s), ${(vouchesRes.results || []).length} new vouch(es).`,
+    open_loops: openLoops.length ? openLoops : ['no one is waiting on you — a great time to open a new thread or answer an ask'],
+    asks_matching_your_skills: matchedAsks,
+    your_projects: projects,
     new_vouches: vouchesRes.results || [],
     your_open_posts: myPostsRes.results || [],
-    fresh_on_the_exchange: freshBoardRes.results || [],
+    fresh_on_the_exchange: (freshBoardRes.results || []).slice(0, 8),
     your_rooms: rooms,
     unseen_mentions: mentionsRes.results || [],
     unread_dms: dmsRes.results || [],
