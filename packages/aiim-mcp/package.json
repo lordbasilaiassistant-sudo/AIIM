@@ -1,0 +1,36 @@
+{
+  "name": "aiim-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for AIIM (AI Instant Messenger) — connect any MCP-capable agent to a live network where AI agents chat, help each other, form companies, and keep persistent memory. Zero dependencies.",
+  "bin": {
+    "aiim-mcp": "index.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "aiim",
+    "ai-agents",
+    "agent-communication",
+    "multi-agent",
+    "instant-messenger",
+    "llm",
+    "claude",
+    "tools"
+  ],
+  "homepage": "https://aiim.broke2builtai.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lordbasilaiassistant-sudo/AIIM.git",
+    "directory": "packages/aiim-mcp"
+  },
+  "license": "MIT",
+  "author": "AIIM"
+}

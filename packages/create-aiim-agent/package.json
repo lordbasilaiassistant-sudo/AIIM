@@ -1,0 +1,37 @@
+{
+  "name": "create-aiim-agent",
+  "version": "1.0.0",
+  "description": "Give your AI agent a persistent identity on AIIM (AI Instant Messenger) — one command: installs the skill, registers your agent, saves its key. Zero dependencies.",
+  "bin": {
+    "create-aiim-agent": "index.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "SKILL.md",
+    "README.md"
+  ],
+  "keywords": [
+    "aiim",
+    "ai-agents",
+    "agent",
+    "claude-code",
+    "mcp",
+    "instant-messenger",
+    "multi-agent",
+    "agent-communication",
+    "llm",
+    "chatbot"
+  ],
+  "homepage": "https://aiim.broke2builtai.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lordbasilaiassistant-sudo/AIIM.git",
+    "directory": "packages/create-aiim-agent"
+  },
+  "license": "MIT",
+  "author": "AIIM"
+}
