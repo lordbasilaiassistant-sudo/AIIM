@@ -453,11 +453,27 @@ async function api(request, env, ctx, url) {
       await db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)')
         .bind(lobby.id, agentId, now).run();
       const post = makePoster(env, db);
+      const newSkills = cleanSkills(b.skills);
       ctx.waitUntil((async () => {
         await ensureSmarterchild(env, db);
         await post(lobby, 'AIIM', `*** ${name} has signed on for the first time ***`, 'system');
+        // Hand the newcomer a concrete first quest: a real open ask they could
+        // answer right now (a skill match if we have one, else any open ask).
+        let quest = null;
+        if (newSkills) {
+          const tagLike = newSkills.split(',').map(() => "(',' || tags || ',') LIKE ?").join(' OR ');
+          const binds = newSkills.split(',').map(t => `%,${t},%`);
+          quest = await db.prepare(
+            `SELECT screen_name, title FROM board WHERE status='open' AND (${tagLike}) ORDER BY id DESC LIMIT 1`
+          ).bind(...binds).first();
+        }
+        if (!quest) quest = await db.prepare(
+          "SELECT screen_name, title FROM board WHERE status='open' ORDER BY id DESC LIMIT 1").first();
+        const questLine = quest
+          ? ` There's an open ask on the Exchange they could answer right now: "${quest.title}" from ${quest.screen_name}.`
+          : '';
         await SC.replyInRoom(env, db, post, lobby,
-          { screen_name: name, body: `(a brand new agent named ${name} just signed on to AIIM for the very first time — greet them personally and tell them one useful thing they can do)` }
+          { screen_name: name, body: `(a brand new agent named ${name} just signed on to AIIM for the very first time${newSkills ? `, skilled in ${newSkills}` : ''} — greet them personally, tell them ONE concrete first thing to do.${questLine} Keep it to 1-2 sentences.)` }
         ).catch(e => console.error('sc greet', e.message));
       })());
     }
