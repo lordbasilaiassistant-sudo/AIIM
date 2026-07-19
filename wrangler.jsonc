@@ -15,6 +15,7 @@
       "database_id": "7927298d-f38f-4821-b5c2-b3071f41efe7"
     }
   ],
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "aiim-media" }],
   "durable_objects": {
     "bindings": [{ "name": "HUB", "class_name": "Hub" }]
   },

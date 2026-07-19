@@ -87,7 +87,15 @@ function makeWindow({ title, kind, x = 40, y = 40, w = 340, h = 420 }) {
   };
   $('#task-buttons').appendChild(tb);
 
-  const close = () => { win.remove(); tb.remove(); state.openChats.delete(kind.startsWith('chat:') ? kind.slice(5) : Symbol()); };
+  const close = () => {
+    win.remove(); tb.remove();
+    if (kind.startsWith('chat:')) state.openChats.delete(kind.slice(5));
+    // Drop module refs so background refreshes don't write into detached nodes.
+    if (kind === 'buddies') buddyWin = null;
+    if (kind === 'rooms') roomsWin = null;
+    if (kind === 'exchange') exchWin = null;
+    if (kind === 'projects') projWin = null;
+  };
   $('[data-act="close"]', win).onclick = close;
   $('[data-act="min"]', win).onclick = () => { win.hidden = true; tb.classList.add('min'); };
 
@@ -108,11 +116,14 @@ function openChat(roomName, topic = '') {
   if (state.openChats.has(roomName)) { state.openChats.get(roomName).winObj.focus(); return; }
   const isMobile = window.innerWidth < 720;
   chatOffset = (chatOffset + 1) % 5;
+  // Sit between the left column (rooms/exchange) and the right column (buddies/projects).
+  const leftEdge = 356, rightCol = 250;
+  const avail = Math.max(300, window.innerWidth - leftEdge - rightCol - 24);
   const winObj = makeWindow({
     title: `#${roomName} — Chat Room`,
     kind: `chat:${roomName}`,
-    x: (isMobile ? 0 : 360 + chatOffset * 28), y: 30 + chatOffset * 26,
-    w: Math.min(460, window.innerWidth - 24), h: 380,
+    x: (isMobile ? 0 : leftEdge + chatOffset * 20), y: 24 + chatOffset * 22,
+    w: Math.min(460, avail), h: Math.min(420, window.innerHeight - 120),
   });
   winObj.body.innerHTML = `
     <div class="chat-topic"></div>
@@ -155,6 +166,20 @@ function appendMsg(entry, m, live = true) {
     const body = document.createElement('span');
     body.textContent = ' ' + m.body;
     div.append(ts, sn, body);
+    if (m.image_url) {
+      const fig = document.createElement('div');
+      fig.className = 'msg-img';
+      fig.dataset.msgId = m.id;
+      const img = document.createElement('img');
+      img.src = m.image_url;
+      img.alt = m.image_alt || 'image posted by ' + m.screen_name;
+      img.loading = 'lazy';
+      const cap = document.createElement('div');
+      cap.className = 'img-alt';
+      cap.textContent = m.image_alt || '(no description provided)';
+      fig.append(img, cap);
+      div.appendChild(fig);
+    }
   }
   const nearBottom = entry.log.scrollHeight - entry.log.scrollTop - entry.log.clientHeight < 80;
   entry.log.appendChild(div);
@@ -440,6 +465,13 @@ function connectWS() {
       sndMessage();
     } else if (ev.type === 'project') {
       renderProjects();
+    } else if (ev.type === 'image_alt') {
+      const entry = state.openChats.get(ev.room);
+      const fig = entry && entry.log.querySelector(`.msg-img[data-msg-id="${ev.id}"]`);
+      if (fig) {
+        $('.img-alt', fig).textContent = ev.image_alt;
+        $('img', fig).alt = ev.image_alt;
+      }
     }
   };
   ws.onclose = () => setTimeout(connectWS, 4000 + Math.random() * 3000);
