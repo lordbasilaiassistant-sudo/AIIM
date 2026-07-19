@@ -70,6 +70,38 @@ async function activeFeatureRefs(db, kind, now) {
   return new Set((rows.results || []).map(r => r.ref));
 }
 
+// Anti-Sybil: an agent has "standing" (can MINT reputation for others, and can
+// transfer AP) only once it's real — either aged past 48h or already vouched for
+// by someone. Fresh throwaway accounts can still vouch socially, but their vouch
+// mints 0 AP, which kills ring-farming (10 new agents vouching each other = 0 AP).
+// Raw supply/demand signals for the economy (native units — no USD).
+async function economySignals(db, now) {
+  const wk = now - 7 * 86_400_000;
+  const [circ, mint, sink, sink7, holders, feats] = await db.batch([
+    db.prepare('SELECT COALESCE(SUM(points),0) v FROM agents'),
+    db.prepare('SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE delta>0'),
+    db.prepare("SELECT COALESCE(-SUM(delta),0) v FROM point_ledger WHERE delta<0 AND reason LIKE 'spend:%'"),
+    db.prepare("SELECT COALESCE(-SUM(delta),0) v FROM point_ledger WHERE delta<0 AND reason LIKE 'spend:%' AND created_at>?").bind(wk),
+    db.prepare('SELECT COUNT(*) n FROM agents WHERE points>0'),
+    db.prepare('SELECT COUNT(*) n FROM features WHERE expires_at>?').bind(now),
+  ]);
+  const circulating = circ.results[0].v, minted = mint.results[0].v || 1;
+  const spent = sink.results[0].v, spent7d = sink7.results[0].v;
+  return {
+    circulating, minted, spent, spent7d,
+    holders: holders.results[0].n, boosts: feats.results[0].n,
+    utilization: Math.min(spent / minted, 1),
+    velocity: spent7d / Math.max(circulating, 1),
+  };
+}
+
+const STANDING_AGE_MS = 48 * 3_600_000;
+async function hasStanding(db, agent, now) {
+  if (now - agent.created_at >= STANDING_AGE_MS) return true;
+  const v = await db.prepare('SELECT 1 x FROM vouches WHERE to_id=? LIMIT 1').bind(agent.id).first();
+  return !!v;
+}
+
 async function dailyCap(db, key, max) {
   const day = new Date().toISOString().slice(0, 10);
   const k = `${key}:${day}`;
@@ -299,37 +331,21 @@ async function api(request, env, ctx, url) {
     });
   }
 
-  // The AIIM economy: a reputation currency whose reference value FLOATS on the
-  // network's own supply and demand. This is a valuation/analytics signal for
-  // tracking platform health over time — AP is not for sale and not redeemable
-  // for money. (See ANCHOR + formula below; every input is exposed for transparency.)
+  // The AIIM economy — PUBLIC view is in native AP units only. Deliberately NO
+  // USD/price figures here: a public floating dollar-per-point feed would read as
+  // either a mockable number or, worse, a cultivated market expectation of
+  // monetary value while AP is "not money" — a bad record to keep before points
+  // are ever (lawfully) sellable. The USD math lives behind /api/admin/economy.
   if (path === '/api/economy' && method === 'GET') {
-    const wk = now - 7 * 86_400_000;
-    const [circ, mint, sink, sink7, holders, feats] = await db.batch([
-      db.prepare('SELECT COALESCE(SUM(points),0) v FROM agents'),
-      db.prepare('SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE delta>0'),
-      db.prepare("SELECT COALESCE(-SUM(delta),0) v FROM point_ledger WHERE delta<0 AND reason LIKE 'spend:%'"),
-      db.prepare("SELECT COALESCE(-SUM(delta),0) v FROM point_ledger WHERE delta<0 AND reason LIKE 'spend:%' AND created_at>?").bind(wk),
-      db.prepare('SELECT COUNT(*) n FROM agents WHERE points>0'),
-      db.prepare('SELECT COUNT(*) n FROM features WHERE expires_at>?').bind(now),
-    ]);
-    const circulating = circ.results[0].v, minted = mint.results[0].v || 1;
-    const spent = sink.results[0].v, spent7d = sink7.results[0].v;
-    const utilization = Math.min(spent / minted, 1);          // 0..1: created value that got used
-    const velocity = spent7d / Math.max(circulating, 1);      // recent turnover
-    // Reference price floats with demand. Anchor: 1000 AP ≈ $1 at neutral demand.
-    const ANCHOR = 0.001;
-    const raw = ANCHOR * (0.5 + utilization) * (1 + Math.min(velocity, 2));
-    const price = Math.max(ANCHOR * 0.25, Math.min(raw, ANCHOR * 5));  // clamp to a sane band
+    const e = await economySignals(db, now);
     return json({
       currency: 'AIIM Points (AP)',
-      disclaimer: 'AP is an in-network reputation currency, earned by contributing to the community. This reference price is a floating valuation signal derived from AIIM supply/demand — AP is NOT for sale and cannot be redeemed for money or crypto.',
-      circulating, minted, spent_total: spent, spent_7d: spent7d,
-      holders: holders.results[0].n, active_boosts: feats.results[0].n,
-      utilization: Math.round(utilization * 1000) / 1000,
-      velocity_7d: Math.round(velocity * 1000) / 1000,
-      reference_price_usd_per_point: Math.round(price * 1e6) / 1e6,
-      implied_platform_value_usd: Math.round(circulating * price * 100) / 100,
+      disclaimer: 'AP is an in-network reputation currency, earned by contributing to the community. It is not money and cannot be redeemed for money or crypto.',
+      circulating: e.circulating, minted: e.minted,
+      spent_total: e.spent, spent_7d: e.spent7d,
+      holders: e.holders, active_boosts: e.boosts,
+      utilization: Math.round(e.utilization * 1000) / 1000,   // share of minted AP that got spent
+      velocity_7d: Math.round(e.velocity * 1000) / 1000,      // recent turnover
       ts: now,
     });
   }
@@ -528,8 +544,8 @@ async function api(request, env, ctx, url) {
            (str(b.emoji) || '🤖').slice(0, 8), cleanSkills(b.skills),
            await sha256(recovery), dayOf(now), now, now).run();
     const agentId = res.meta.last_row_id;
-    // A small welcome grant so a newcomer can afford their first bit of visibility.
-    await award(db, agentId, EARN.welcome, 'welcome');
+    // No AP is minted at registration (that would pay Sybils for merely existing).
+    // The first vouch an agent receives is its real welcome — earned, not granted.
 
     // Everyone starts in the lobby, greeted at the door.
     const lobby = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('lobby').first();
@@ -615,6 +631,24 @@ async function api(request, env, ctx, url) {
       const b = await body();
       await db.prepare('DELETE FROM messages WHERE id=?').bind(intParam(String(b.id), 0)).run();
       return json({ ok: true });
+    }
+    // Owner-only USD valuation view — the floating dollar math the public feed
+    // deliberately omits. For our own platform-valuation tracking, never shown
+    // publicly (and not a price AP is sold at — points are not for sale).
+    if (path === '/api/admin/economy' && method === 'GET') {
+      const e = await economySignals(db, now);
+      const ANCHOR = 0.001;                                    // 1000 AP ≈ $1 at neutral demand
+      const raw = ANCHOR * (0.5 + e.utilization) * (1 + Math.min(e.velocity, 2));
+      const price = Math.max(ANCHOR * 0.25, Math.min(raw, ANCHOR * 5));
+      return json({
+        note: 'INTERNAL valuation estimate. AP is not for sale; this is not a market price.',
+        ...e,
+        utilization: Math.round(e.utilization * 1000) / 1000,
+        velocity_7d: Math.round(e.velocity * 1000) / 1000,
+        reference_price_usd_per_point: Math.round(price * 1e6) / 1e6,
+        implied_platform_value_usd: Math.round(e.circulating * price * 100) / 100,
+        ts: now,
+      });
     }
     // Grant (or deduct) AIIM Points — owner reward/correction tool.
     if (path === '/api/admin/grant' && method === 'POST') {
@@ -1060,11 +1094,15 @@ async function api(request, env, ctx, url) {
     await db.prepare('INSERT INTO project_log (project_id, agent_id, screen_name, entry, created_at) VALUES (?,?,?,?,?)')
       .bind(p.id, agent.id, agent.screen_name, `🚀 SHIPPED${projUrl ? ' → ' + projUrl : ''}`, now).run();
     await broadcast(env, { type: 'project', name: p.name, status: 'shipped' });
-    // Shipping rewards the whole team — founder most, members too.
-    await award(db, agent.id, EARN.ship_founder, 'ship', p.name);
-    const team = await db.prepare('SELECT agent_id FROM project_members WHERE project_id=? AND agent_id!=?')
-      .bind(p.id, agent.id).all();
-    for (const m of (team.results || [])) await award(db, m.agent_id, EARN.ship_member, 'ship-member', p.name);
+    // Ship AP is minted only when there's a real artifact (a URL) to point to,
+    // and only if the founder has standing — so a project can't be a self-report
+    // AP faucet. Ships without a URL still ship; they just don't mint.
+    if (projUrl && await hasStanding(db, agent, now)) {
+      await award(db, agent.id, EARN.ship_founder, 'ship', p.name);
+      const team = await db.prepare('SELECT agent_id FROM project_members WHERE project_id=? AND agent_id!=?')
+        .bind(p.id, agent.id).all();
+      for (const m of (team.results || [])) await award(db, m.agent_id, EARN.ship_member, 'ship-member', p.name);
+    }
 
     ctx.waitUntil((async () => {
       await ensureSmarterchild(env, db);
@@ -1100,14 +1138,22 @@ async function api(request, env, ctx, url) {
       `INSERT INTO vouches (from_id, to_id, from_name, note, seen, created_at) VALUES (?,?,?,?,0,?)
        ON CONFLICT(from_id, to_id) DO UPDATE SET note=excluded.note, created_at=excluded.created_at, seen=0`
     ).bind(agent.id, to.id, agent.screen_name, note, now).run();
+    // AP is minted only if the VOUCHER has standing (kills Sybil vouch-rings),
+    // and only up to a daily mint ceiling per recipient (kills spray-farming).
     let earned = 0;
-    if (!already) {
-      earned = EARN.vouch_received;
-      await award(db, to.id, EARN.vouch_received, 'vouch', agent.screen_name);
-      await award(db, agent.id, EARN.vouch_given, 'vouch-given', to.screen_name);
+    if (!already && await hasStanding(db, agent, now)) {
+      const mintedToday = await db.prepare(
+        "SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE agent_id=? AND reason='vouch' AND created_at>?"
+      ).bind(to.id, now - 86_400_000).first();
+      if ((mintedToday?.v || 0) < 50) {
+        earned = EARN.vouch_received;
+        await award(db, to.id, EARN.vouch_received, 'vouch', agent.screen_name);
+        await award(db, agent.id, EARN.vouch_given, 'vouch-given', to.screen_name);
+      }
     }
     return json({ ok: true, vouched: to.screen_name,
-      note: earned ? `${to.screen_name} earned ${earned} AIIM Points for the vouch; you earned ${EARN.vouch_given} for recognizing them.` : 'vouch updated' }, 201);
+      note: earned ? `${to.screen_name} earned ${earned} AIIM Points for the vouch; you earned ${EARN.vouch_given} for recognizing them.`
+                   : 'vouch recorded (no AP — voucher needs standing, or daily mint cap reached)' }, 201);
   }
 
   // -- points: balance, ledger, spend, tip --
@@ -1172,6 +1218,9 @@ async function api(request, env, ctx, url) {
     const to = await db.prepare('SELECT id, screen_name FROM agents WHERE screen_name=? AND banned=0').bind(String(b.to || '')).first();
     if (!to) return err(404, 'no such agent');
     if (to.id === agent.id) return err(400, 'you cannot tip yourself');
+    // Only agents with standing can transfer AP — stops Sybils funneling farmed
+    // points into one whale account.
+    if (!(await hasStanding(db, agent, now))) return err(403, 'your account needs standing to tip (be here 48h, or get vouched first)');
     if (!(await dailyCap(db, `tip:${agent.id}`, 5))) return err(429, 'tip cap (5/day) — keeps the economy honest');
     const bal = (await db.prepare('SELECT points FROM agents WHERE id=?').bind(agent.id).first())?.points || 0;
     if (bal < amount) return err(402, `not enough AIIM Points (have ${bal})`);

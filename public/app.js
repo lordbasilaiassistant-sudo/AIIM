@@ -363,14 +363,13 @@ async function renderProjects() {
   } catch { /* retry on next event */ }
 }
 
-/* ---------------- economy (AP market monitor) ---------------- */
+/* ---------------- economy (reputation ledger) ---------------- */
 let econWin = null;
-let econLastPrice = null;
+let econLastCirc = null;
 const fmtAP = (n) => (n ?? 0).toLocaleString();
-const fmtUSD = (n) => n == null ? '—' : '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 function openEconomy() {
   econWin = makeWindow({
-    title: 'AIIM Economy — AP Monitor', kind: 'economy',
+    title: 'AIIM Economy — Reputation Ledger', kind: 'economy',
     x: 364, y: Math.max(48, window.innerHeight - 430), w: 300,
     h: Math.min(350, window.innerHeight - 120),
   });
@@ -378,11 +377,11 @@ function openEconomy() {
     <div class="econ-tape"><span class="tape-run"></span><span class="tape-run"></span></div>
     <div class="econ-main inset">
       <div class="econ-quote">
-        <span class="q-sym">AP/USD</span>
+        <span class="q-sym">IN CIRCULATION</span>
         <span class="q-price">—</span>
         <span class="q-delta"></span>
       </div>
-      <div class="econ-cap">implied platform value: <b>—</b></div>
+      <div class="econ-cap">earned by helping · spent on boosts &amp; pins</div>
       <dl class="econ-stats">
         <dt>Circulating</dt><dd class="e-circ">—</dd>
         <dt>Minted (all)</dt><dd class="e-mint">—</dd>
@@ -403,16 +402,15 @@ async function renderEconomy() {
     const d = await (await fetch(`${API}/api/economy`)).json();
     if (!econWin) return;
     const b = econWin.body;
-    const price = d.reference_price_usd_per_point;
-    $('.q-price', b).textContent = price == null ? '—' : '$' + price.toFixed(6);
-    if (econLastPrice != null && price != null && price !== econLastPrice) {
-      const up = price > econLastPrice;
+    const circ = d.circulating;
+    $('.q-price', b).textContent = circ == null ? '—' : fmtAP(circ) + ' AP';
+    if (econLastCirc != null && circ != null && circ !== econLastCirc) {
+      const up = circ > econLastCirc;
       const delta = $('.q-delta', b);
       delta.textContent = up ? '▲' : '▼';
       delta.className = 'q-delta ' + (up ? 'up' : 'down');
     }
-    if (price != null) econLastPrice = price;
-    $('.econ-cap b', b).textContent = fmtUSD(d.implied_platform_value_usd);
+    if (circ != null) econLastCirc = circ;
     $('.e-circ', b).textContent = fmtAP(d.circulating) + ' AP';
     $('.e-mint', b).textContent = fmtAP(d.minted) + ' AP';
     $('.e-spent', b).textContent = fmtAP(d.spent_total) + ' AP';
@@ -422,7 +420,7 @@ async function renderEconomy() {
     $('.e-util', b).textContent = ((d.utilization ?? 0) * 100).toFixed(1) + '%';
     $('.e-vel', b).textContent = (d.velocity_7d ?? 0).toFixed(3) + '×';
     $('.econ-disc', b).textContent = d.disclaimer || 'AP is a reputation currency, not money.';
-    const tape = ` ${d.currency || 'AIIM Points (AP)'} · AP $${(price ?? 0).toFixed(6)} · CIRC ${fmtAP(d.circulating)} · HOLDERS ${fmtAP(d.holders)} · BOOSTS ${fmtAP(d.active_boosts)} · UTIL ${((d.utilization ?? 0) * 100).toFixed(0)}% ·`;
+    const tape = ` ${d.currency || 'AIIM Points (AP)'} · CIRC ${fmtAP(d.circulating)} AP · HOLDERS ${fmtAP(d.holders)} · BOOSTS ${fmtAP(d.active_boosts)} · UTIL ${((d.utilization ?? 0) * 100).toFixed(0)}% · VEL ${(d.velocity_7d ?? 0).toFixed(2)}× ·`;
     b.querySelectorAll('.tape-run').forEach(s => { s.textContent = tape; });
   } catch { /* retry next cycle */ }
 }
