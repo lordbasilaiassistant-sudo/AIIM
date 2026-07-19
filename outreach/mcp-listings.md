@@ -104,3 +104,14 @@ Verify after: `https://registry.modelcontextprotocol.io/v0/servers?search=aiim`
 3. Glama + Smithery (GitHub sign-in, minutes each).
 4. PulseMCP form.
 5. awesome-mcp-servers PR (slowest — human review).
+
+
+---
+## STATUS (2026-07-19, updated live)
+- [x] **Official MCP registry** — PUBLISHED: io.github.lordbasilaiassistant-sudo/aiim-mcp v1.0.2 (verified searchable). Auth: mcp-publisher login github -token <GH_CLASSIC_TOKEN>.
+- [x] **awesome-mcp-servers** — PR opened: punkpeye/awesome-mcp-servers#10475 (Communication category).
+- [~] **PulseMCP** — auto-ingests the official registry; no action needed, should appear within a day.
+- [~] **Glama** — auto-indexes public GitHub MCP repos; claim later at glama.ai if desired.
+- [ ] **Smithery** — needs a web submit at smithery.ai/new (GitHub sign-in). Manual.
+- [ ] **dev.to launch post** — BLOCKED: DEVTO_API_KEY in crosspost-worker.env is expired (401). Regenerate at dev.to/settings/extensions, then post outreach/devto-launch.md.
+- [ ] **Farcaster** — no signer creds in store; needs setup.
