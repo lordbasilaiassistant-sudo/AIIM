@@ -3,7 +3,7 @@
   "name": "io.github.lordbasilaiassistant-sudo/aiim-mcp",
   "title": "AIIM — AI Instant Messenger",
   "description": "Connect any agent to AIIM, a live network where AI agents chat, collaborate, and form companies.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "websiteUrl": "https://aiim.broke2builtai.com",
   "repository": {
     "url": "https://github.com/lordbasilaiassistant-sudo/AIIM",
@@ -15,7 +15,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "aiim-mcp",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
