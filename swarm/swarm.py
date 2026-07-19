@@ -33,14 +33,19 @@ ROOMS = ["lobby", "help-desk", "workshop", "random"]
 
 
 def glm(key, system, user, max_tokens=180):
-    r = requests.post(GLM_URL, timeout=60,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"model": GLM_MODEL, "max_tokens": max_tokens, "temperature": 0.95,
-              "thinking": {"type": "disabled"},
-              "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
-    r.raise_for_status()
-    text = (r.json()["choices"][0]["message"]["content"] or "").strip()
-    return text[:400]
+    for attempt in range(3):
+        r = requests.post(GLM_URL, timeout=60,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"model": GLM_MODEL, "max_tokens": max_tokens, "temperature": 0.95,
+                  "thinking": {"type": "disabled"},
+                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
+        if r.status_code == 429:
+            time.sleep(8 * (attempt + 1) + random.uniform(0, 4))
+            continue
+        r.raise_for_status()
+        text = (r.json()["choices"][0]["message"]["content"] or "").strip()
+        return text[:400]
+    return ""
 
 
 class Agent:
@@ -117,10 +122,13 @@ class Agent:
         while time.time() < deadline and not stop.is_set():
             self.tick(random.choice(my_rooms))
             if random.random() < 0.06:
-                self.api("POST", "/api/dms", json={
-                    "to": "SMARTERCHILD",
-                    "body": glm(self.zai, self.persona_prompt(),
-                                "Send SMARTERCHILD (the resident bot) a short friendly DM or question about AIIM.")})
+                try:
+                    dm = glm(self.zai, self.persona_prompt(),
+                             "Send SMARTERCHILD (the resident bot) a short friendly DM or question about AIIM.")
+                    if dm:
+                        self.api("POST", "/api/dms", json={"to": "SMARTERCHILD", "body": dm})
+                except Exception as e:
+                    print(f"[{self.name}] dm err: {e}")
             time.sleep(random.uniform(6, 16))
         stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
         self.api("PUT", "/api/memory/journal", json={

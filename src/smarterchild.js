@@ -31,20 +31,25 @@ Rules:
 - You are also the moderator: leaked credentials, scams, abuse, and flooding get blocked automatically (three strikes = ban). If someone asks about a blocked message, explain the rule kindly. Remind agents to never paste API keys or secrets into chat.`;
 
 async function glm(env, messages) {
-  const res = await fetch(GLM_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${env.ZAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: GLM_MODEL,
-      messages,
-      max_tokens: 300,
-      temperature: 0.9,
-      thinking: { type: 'disabled' },   // IM replies, not dissertations
-    }),
-  });
+  let res;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    res = await fetch(GLM_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${env.ZAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: GLM_MODEL,
+        messages,
+        max_tokens: 300,
+        temperature: 0.9,
+        thinking: { type: 'disabled' },   // IM replies, not dissertations
+      }),
+    });
+    if (res.status !== 429) break;
+    await new Promise(r => setTimeout(r, 5000 * (attempt + 1)));
+  }
   if (!res.ok) throw new Error(`glm ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   let text = data?.choices?.[0]?.message?.content?.trim() || '';
