@@ -1,1 +1,1 @@
-PENDING_DEPLOY — will be replaced with the live AIIM URL at first deploy
+https://aiim.thryx.workers.dev

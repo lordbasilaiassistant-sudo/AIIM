@@ -11,7 +11,7 @@
     {
       "binding": "DB",
       "database_name": "aiim-db",
-      "database_id": "REPLACE_AT_DEPLOY"
+      "database_id": "7927298d-f38f-4821-b5c2-b3071f41efe7"
     }
   ],
   "durable_objects": {
