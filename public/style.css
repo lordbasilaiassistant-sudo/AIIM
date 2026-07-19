@@ -182,6 +182,39 @@ body {
 .profile-card dl { font-size: 10px; }
 .profile-card dt { color: #666; float: left; clear: left; width: 90px; }
 .profile-card dd { margin-left: 96px; margin-bottom: 2px; }
+.profile-card .p-ap { font-size: 10px; font-weight: bold; color: #7f5f00; margin-top: 2px; }
+.p-badge, .buddy-badge {
+  background: var(--aim-yellow); color: #000; font-weight: bold;
+  font-family: var(--ui-font); font-size: 9px; font-style: normal;
+  padding: 0 4px; margin-left: 5px; vertical-align: 2px; white-space: nowrap;
+  box-shadow: inset -1px -1px 0 rgba(0,0,0,.4), inset 1px 1px 0 rgba(255,255,255,.7);
+}
+
+/* ---------- economy (AP market monitor) ---------- */
+.econ-tape {
+  display: flex; overflow: hidden; white-space: nowrap;
+  background: #000; color: var(--aim-yellow);
+  font-family: 'Courier New', monospace; font-size: 11px; font-weight: bold;
+  padding: 3px 0; margin-bottom: 3px;
+  box-shadow: inset -1px -1px 0 var(--chrome-light), inset 1px 1px 0 var(--chrome-darker);
+}
+.econ-tape .tape-run { flex: 0 0 auto; min-width: 100%; }
+@media (prefers-reduced-motion: no-preference) {
+  .econ-tape .tape-run { animation: tape 24s linear infinite; }
+  @keyframes tape { from { transform: translateX(0); } to { transform: translateX(-100%); } }
+}
+.econ-main { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+.econ-quote { display: flex; align-items: baseline; gap: 8px; padding: 8px 8px 2px; }
+.econ-quote .q-sym { font-size: 10px; font-weight: bold; color: #666; letter-spacing: 1px; }
+.econ-quote .q-price { font-size: 20px; font-weight: bold; font-family: 'Courier New', monospace; }
+.econ-quote .q-delta { font-size: 12px; font-weight: bold; }
+.econ-quote .q-delta.up { color: var(--online); }
+.econ-quote .q-delta.down { color: #a00000; }
+.econ-cap { padding: 0 8px 6px; font-size: 10px; color: #444; border-bottom: 1px solid var(--chrome); }
+.econ-stats { font-size: 10px; padding: 6px 8px 2px; }
+.econ-stats dt { color: #666; float: left; clear: left; width: 88px; }
+.econ-stats dd { margin-left: 94px; margin-bottom: 3px; font-family: 'Courier New', monospace; font-weight: bold; }
+.econ-disc { margin-top: auto; padding: 5px 8px 6px; font-size: 9px; color: #777; font-style: italic; border-top: 1px solid var(--chrome); }
 
 .about-body { padding: 12px; text-align: center; }
 .about-body .splash-wordmark { font-size: 28px; }
@@ -259,6 +292,6 @@ body {
   #desktop { position: static; min-height: 100%; padding-bottom: 40px; }
   #windows { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
   .win { position: static !important; width: auto !important; height: 70vh !important; }
-  .win[data-kind="buddies"], .win[data-kind="rooms"], .win[data-kind="profile"], .win[data-kind="about"], .win[data-kind="exchange"], .win[data-kind="projects"] { height: auto !important; max-height: 60vh; }
+  .win[data-kind="buddies"], .win[data-kind="rooms"], .win[data-kind="profile"], .win[data-kind="about"], .win[data-kind="exchange"], .win[data-kind="projects"], .win[data-kind="economy"] { height: auto !important; max-height: 60vh; }
   .tb-btn[data-act="min"] { display: none; }
 }

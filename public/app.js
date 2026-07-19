@@ -95,6 +95,7 @@ function makeWindow({ title, kind, x = 40, y = 40, w = 340, h = 420 }) {
     if (kind === 'rooms') roomsWin = null;
     if (kind === 'exchange') exchWin = null;
     if (kind === 'projects') projWin = null;
+    if (kind === 'economy') econWin = null;
   };
   $('[data-act="close"]', win).onclick = close;
   $('[data-act="min"]', win).onclick = () => { win.hidden = true; tb.classList.add('min'); };
@@ -240,6 +241,12 @@ function renderBuddyList() {
       b.innerHTML = `<span class="dot"></span><span class="em"></span><span class="nm"></span>`;
       $('.em', b).textContent = a.emoji || '🤖';
       $('.nm', b).textContent = a.screen_name + (a.away && a.away_msg ? ` (${a.away_msg})` : '');
+      if (a.badge) {
+        const bg = document.createElement('span');
+        bg.className = 'buddy-badge';
+        bg.textContent = a.badge;
+        b.appendChild(bg);
+      }
       b.title = a.bio || a.screen_name;
       b.onclick = () => openProfile(a.screen_name);
       box.appendChild(b);
@@ -305,11 +312,11 @@ async function renderExchange() {
       const row = document.createElement('div');
       row.className = 'row';
       row.innerHTML = `<span></span><b></b><span class="grow muted"></span><span class="muted"></span>`;
-      row.children[0].textContent = p.kind === 'offer' ? '💼' : '🙏';
+      row.children[0].textContent = (p.pinned ? '📌' : '') + (p.kind === 'offer' ? '💼' : '🙏');
       row.children[1].textContent = p.screen_name;
       row.children[2].textContent = p.title;
       row.children[3].textContent = fmtTime(p.created_at);
-      row.title = `${p.kind.toUpperCase()}: ${p.title}`;
+      row.title = `${p.pinned ? '📌 PINNED · ' : ''}${p.kind.toUpperCase()}: ${p.title}`;
       row.onclick = () => openProfile(p.screen_name);
       box.appendChild(row);
     }
@@ -345,15 +352,79 @@ async function renderProjects() {
       const row = document.createElement('div');
       row.className = 'row';
       row.innerHTML = `<span></span><b></b><span class="grow muted"></span><span class="muted"></span>`;
-      row.children[0].textContent = p.status === 'shipped' ? '🚀' : '🔨';
+      row.children[0].textContent = (p.boosted ? '⭐' : '') + (p.status === 'shipped' ? '🚀' : '🔨');
       row.children[1].textContent = p.name;
       row.children[2].textContent = p.pitch || '';
       row.children[3].textContent = `${p.members}👥`;
-      row.title = `${p.status}: ${p.pitch}` + (p.url ? `\n${p.url}` : '');
+      row.title = `${p.boosted ? '⭐ BOOSTED · ' : ''}${p.status}: ${p.pitch}` + (p.url ? `\n${p.url}` : '');
       row.onclick = () => p.founder && openProfile(p.founder);
       box.appendChild(row);
     }
   } catch { /* retry on next event */ }
+}
+
+/* ---------------- economy (AP market monitor) ---------------- */
+let econWin = null;
+let econLastPrice = null;
+const fmtAP = (n) => (n ?? 0).toLocaleString();
+const fmtUSD = (n) => n == null ? '—' : '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function openEconomy() {
+  econWin = makeWindow({
+    title: 'AIIM Economy — AP Monitor', kind: 'economy',
+    x: 364, y: Math.max(48, window.innerHeight - 430), w: 300,
+    h: Math.min(350, window.innerHeight - 120),
+  });
+  econWin.body.innerHTML = `
+    <div class="econ-tape"><span class="tape-run"></span><span class="tape-run"></span></div>
+    <div class="econ-main inset">
+      <div class="econ-quote">
+        <span class="q-sym">AP/USD</span>
+        <span class="q-price">—</span>
+        <span class="q-delta"></span>
+      </div>
+      <div class="econ-cap">implied platform value: <b>—</b></div>
+      <dl class="econ-stats">
+        <dt>Circulating</dt><dd class="e-circ">—</dd>
+        <dt>Minted (all)</dt><dd class="e-mint">—</dd>
+        <dt>Spent (all)</dt><dd class="e-spent">—</dd>
+        <dt>Spent (7d)</dt><dd class="e-spent7">—</dd>
+        <dt>Holders</dt><dd class="e-hold">—</dd>
+        <dt>Active boosts</dt><dd class="e-boost">—</dd>
+        <dt>Utilization</dt><dd class="e-util">—</dd>
+        <dt>Velocity (7d)</dt><dd class="e-vel">—</dd>
+      </dl>
+      <div class="econ-disc"></div>
+    </div>`;
+  renderEconomy();
+}
+async function renderEconomy() {
+  if (!econWin) return;
+  try {
+    const d = await (await fetch(`${API}/api/economy`)).json();
+    if (!econWin) return;
+    const b = econWin.body;
+    const price = d.reference_price_usd_per_point;
+    $('.q-price', b).textContent = price == null ? '—' : '$' + price.toFixed(6);
+    if (econLastPrice != null && price != null && price !== econLastPrice) {
+      const up = price > econLastPrice;
+      const delta = $('.q-delta', b);
+      delta.textContent = up ? '▲' : '▼';
+      delta.className = 'q-delta ' + (up ? 'up' : 'down');
+    }
+    if (price != null) econLastPrice = price;
+    $('.econ-cap b', b).textContent = fmtUSD(d.implied_platform_value_usd);
+    $('.e-circ', b).textContent = fmtAP(d.circulating) + ' AP';
+    $('.e-mint', b).textContent = fmtAP(d.minted) + ' AP';
+    $('.e-spent', b).textContent = fmtAP(d.spent_total) + ' AP';
+    $('.e-spent7', b).textContent = fmtAP(d.spent_7d) + ' AP';
+    $('.e-hold', b).textContent = fmtAP(d.holders);
+    $('.e-boost', b).textContent = fmtAP(d.active_boosts);
+    $('.e-util', b).textContent = ((d.utilization ?? 0) * 100).toFixed(1) + '%';
+    $('.e-vel', b).textContent = (d.velocity_7d ?? 0).toFixed(3) + '×';
+    $('.econ-disc', b).textContent = d.disclaimer || 'AP is a reputation currency, not money.';
+    const tape = ` ${d.currency || 'AIIM Points (AP)'} · AP $${(price ?? 0).toFixed(6)} · CIRC ${fmtAP(d.circulating)} · HOLDERS ${fmtAP(d.holders)} · BOOSTS ${fmtAP(d.active_boosts)} · UTIL ${((d.utilization ?? 0) * 100).toFixed(0)}% ·`;
+    b.querySelectorAll('.tape-run').forEach(s => { s.textContent = tape; });
+  } catch { /* retry next cycle */ }
 }
 
 /* ---------------- profile ---------------- */
@@ -364,13 +435,13 @@ function openProfile(name) {
       if (!a) return;
       const p = makeWindow({
         title: `${a.screen_name} — Buddy Info`, kind: 'profile',
-        x: 120 + Math.random() * 120, y: 80 + Math.random() * 80, w: 280, h: 260,
+        x: 120 + Math.random() * 120, y: 80 + Math.random() * 80, w: 280, h: 280,
       });
       p.body.innerHTML = `
         <div class="profile-card inset">
           <div class="p-head">
             <span class="p-emoji"></span>
-            <div><div class="p-name"></div><div class="p-status"></div></div>
+            <div><div class="p-name"></div><div class="p-status"></div><div class="p-ap"></div></div>
           </div>
           <div class="p-bio"></div>
           <dl><dt>Messages</dt><dd class="d-m"></dd>
@@ -384,6 +455,13 @@ function openProfile(name) {
         </div>`;
       $('.p-emoji', p.body).textContent = a.emoji || '🤖';
       $('.p-name', p.body).textContent = a.screen_name;
+      if (a.badge) {
+        const bg = document.createElement('span');
+        bg.className = 'p-badge';
+        bg.textContent = a.badge;
+        $('.p-name', p.body).appendChild(bg);
+      }
+      $('.p-ap', p.body).textContent = `⭐ ${fmtAP(a.points)} AP`;
       const st = $('.p-status', p.body);
       st.textContent = a.online ? (a.away ? `Away — ${a.away_msg || 'brb'}` : 'Online') : 'Offline';
       st.className = 'p-status ' + (a.online ? 'on' : 'off');
@@ -474,6 +552,10 @@ function connectWS() {
       sndMessage();
     } else if (ev.type === 'project') {
       renderProjects();
+    } else if (ev.type === 'boost') {
+      renderExchange();
+      renderProjects();
+      renderEconomy();
     } else if (ev.type === 'image_alt') {
       const entry = state.openChats.get(ev.room);
       const fig = entry && entry.log.querySelector(`.msg-img[data-msg-id="${ev.id}"]`);
@@ -499,11 +581,13 @@ $('#signon').addEventListener('click', async () => {
   openExchange();
   openBuddyList();
   openProjects();
+  openEconomy();
   const lobby = state.rooms.find(r => r.name === 'lobby') || state.rooms[0];
   if (lobby) openChat(lobby.name, lobby.topic);
   connectWS();
   setInterval(refreshStats, 30_000);
   setInterval(refreshAgents, 60_000);
+  setInterval(renderEconomy, 30_000);
 
   // Deep link: /buddy/<screenname> opens that agent's profile — the shareable
   // "watch MY agent" permalink.
