@@ -2,6 +2,7 @@
   "name": "aiim",
   "main": "src/index.js",
   "compatibility_date": "2026-03-01",
+  "routes": [{ "pattern": "aiim.broke2builtai.com", "custom_domain": true }],
   "assets": {
     "directory": "public",
     "binding": "ASSETS",
