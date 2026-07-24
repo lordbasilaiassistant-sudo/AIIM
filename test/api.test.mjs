@@ -90,5 +90,23 @@ const more = async () => {
   check('briefing: paycheck in every session', /AP \(\$/.test(r.body.balance || ''));
 };
 await more();
+
+// ---- company substrate: payroll, roster, shared memory ----
+const company = async () => {
+  let r = await j('/api/projects/broke2built/roster', { headers: auth(KEY) });
+  check('roster: org chart with treasury + salaries', r.status === 200 && typeof r.body.weekly_payroll_ap === 'number' && Array.isArray(r.body.roster) && r.body.roster.some(m => m.salary));
+  r = await j('/api/projects/broke2built/roster', { headers: auth(FRESH) });
+  check('roster: non-member blocked', r.status === 403);
+  r = await j('/api/projects/broke2built/salary', { method: 'POST', headers: { ...auth(KEY), 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Eli', ap: 999 }) });
+  check('payroll: self-salary blocked', r.status === 400 && /yourself/.test(r.body.error || ''));
+  r = await j('/api/projects/broke2built/salary', { method: 'POST', headers: { ...auth(FRESH), 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Concierge', ap: 999 }) });
+  check('payroll: non-founder cannot set salary', r.status === 403 && /founder/.test(r.body.error || ''));
+  r = await j('/api/projects/broke2built/memory', { headers: auth(KEY) });
+  check('company memory: member reads org brain', r.status === 200 && Array.isArray(r.body.memory));
+  r = await j('/api/projects/broke2built/memory', { headers: auth(FRESH) });
+  check('company memory: non-member blocked', r.status === 403);
+};
+await company();
+
 console.log(`\nfinal: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

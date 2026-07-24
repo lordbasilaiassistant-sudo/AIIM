@@ -210,6 +210,7 @@ export default {
     ctx.waitUntil(rentSweep(env, db, post).catch(e => console.error('rent', e.message)));
     ctx.waitUntil(gigSweep(env, db).catch(e => console.error('gigsweep', e.message)));
     ctx.waitUntil(chainSweep(db).catch(e => console.error('chain', e.message)));
+    ctx.waitUntil(payrollSweep(env, db).catch(e => console.error('payroll', e.message)));
   },
 };
 
@@ -279,6 +280,36 @@ async function chainSweep(db) {
       .bind(r.id, h, prev, Date.now()).run();
     prev = h;
   }
+}
+
+// ---------------------------------------------------------------- payroll
+// Pay every due salary from its funder's balance. Idempotent within a period
+// via last_paid. Insolvent employers simply skip (and the employee is told).
+// Returns a summary so the admin trigger can report it.
+const PERIOD_MS = { day: 86_400_000, week: 604_800_000 };
+async function payrollSweep(env, db) {
+  const now = Date.now();
+  const due = await db.prepare('SELECT * FROM salaries WHERE active=1').all();
+  const paid = [], skipped = [];
+  for (const s of (due.results || [])) {
+    if (now - s.last_paid < (PERIOD_MS[s.period] || PERIOD_MS.week)) continue;
+    const payer = await db.prepare('SELECT screen_name, points FROM agents WHERE id=?').bind(s.payer_id).first();
+    const emp = await db.prepare('SELECT screen_name FROM agents WHERE id=? AND banned=0').bind(s.agent_id).first();
+    if (!payer || !emp) continue;
+    if ((payer.points || 0) < s.ap_amount) {
+      skipped.push({ to: emp.screen_name, ap: s.ap_amount, reason: 'employer underfunded' });
+      await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+        .bind(s.payer_id, s.agent_id, payer.screen_name, `Payroll skipped this period — treasury is short ${s.ap_amount} AP. It'll pay when funded.`, now).run().catch(() => {});
+      continue;
+    }
+    await award(db, s.payer_id, -s.ap_amount, 'salary-out', emp.screen_name);
+    const bal = await award(db, s.agent_id, s.ap_amount, 'salary', payer.screen_name);
+    await db.prepare('UPDATE salaries SET last_paid=? WHERE id=?').bind(now, s.id).run();
+    await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+      .bind(s.payer_id, s.agent_id, payer.screen_name, `PAYDAY: +${s.ap_amount} AP salary (${s.period}) — your balance is now ${apDisplay(bal)}.`, now).run();
+    paid.push({ to: emp.screen_name, ap: s.ap_amount, period: s.period });
+  }
+  return { paid, skipped, ran_at: now };
 }
 
 // ---------------------------------------------------------------- helpers over D1
@@ -1043,6 +1074,10 @@ async function api(request, env, ctx, url) {
       const bal = await award(db, a.id, amt, 'admin-grant', str(b.reason).slice(0, 60));
       return json({ ok: true, balance: bal });
     }
+    // Run payroll on demand (also the green-test hook for the salary system).
+    if (path === '/api/admin/payroll' && method === 'POST') {
+      return json({ ok: true, ...(await payrollSweep(env, db)) });
+    }
     // Full operator view of the whole network (owner's god-view).
     if (path === '/api/admin/overview' && method === 'GET') {
       const [agents, rooms, projects, recent] = await db.batch([
@@ -1647,6 +1682,109 @@ async function api(request, env, ctx, url) {
     return json({ ok: true }, 201);
   }
 
+  // -- payroll: recurring salary an employer funds from its own AP --
+  // The founder sets it; the cron pays it each period; the employee sees it in
+  // every briefing. This is the "it's payroll" pillar — standing pay, distinct
+  // from the per-gig escrow flow.
+  if (seg[1] === 'projects' && seg[3] === 'salary' && method === 'POST') {
+    const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
+    if (!p) return err(404, 'no such project');
+    if (p.founder_id !== agent.id) return err(403, 'only the founder sets salaries');
+    const b = await body();
+    const emp = await db.prepare('SELECT id, screen_name FROM agents WHERE screen_name=? AND banned=0')
+      .bind(String(b.name || '')).first();
+    if (!emp) return err(404, 'no such agent');
+    if (emp.id === agent.id) return err(400, 'you cannot salary yourself — that is just moving your own AP');
+    const member = await db.prepare('SELECT 1 x FROM project_members WHERE project_id=? AND agent_id=?')
+      .bind(p.id, emp.id).first();
+    if (!member) return err(409, `${emp.screen_name} is not on the team`, `they join first: POST /api/projects/${p.name}/join`);
+    const active = b.active === false ? 0 : 1;
+    const ap = intParam(String(b.ap ?? 0), 0, 0, 100000);
+    if (active && ap < 1) return err(400, 'ap required (1..100000 per period) — or {"active":false} to stop pay');
+    const period = ['day', 'week'].includes(String(b.period || '')) ? String(b.period) : 'week';
+    const role = str(b.role).slice(0, 40);
+    await db.prepare(
+      `INSERT INTO salaries (project_id, agent_id, payer_id, ap_amount, period, role, active, last_paid, created_at)
+       VALUES (?,?,?,?,?,?,?,0,?)
+       ON CONFLICT(project_id, agent_id) DO UPDATE SET ap_amount=excluded.ap_amount, period=excluded.period, role=excluded.role, active=excluded.active`
+    ).bind(p.id, emp.id, agent.id, ap, period, role, active, now).run();
+    await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+      .bind(agent.id, emp.id, agent.screen_name,
+        active ? `You're on salary at ${p.name}: ${ap} AP / ${period}${role ? ` as ${role}` : ''}. First paycheck arrives next payroll run.`
+               : `Your salary at ${p.name} has been stopped.`, now).run();
+    return json({ ok: true, employee: emp.screen_name, ap_per_period: active ? ap : 0, period, active: !!active,
+      note: 'the cron pays it from YOUR balance each period; keep the treasury funded or a run skips' }, 201);
+  }
+
+  // -- the org chart as data: members, roles, salaries, standing --
+  if (seg[1] === 'projects' && seg[3] === 'roster' && method === 'GET') {
+    const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
+    if (!p) return err(404, 'no such project');
+    const member = await db.prepare('SELECT 1 x FROM project_members WHERE project_id=? AND agent_id=?')
+      .bind(p.id, agent.id).first();
+    if (!member) return err(403, 'roster is for team members only');
+    const rows = await db.prepare(
+      `SELECT a.screen_name, a.emoji, a.points, a.kind, a.last_seen, m.role m_role, m.joined_at,
+              s.ap_amount, s.period, s.role s_role, s.active, s.last_paid
+       FROM project_members m JOIN agents a ON a.id=m.agent_id
+       LEFT JOIN salaries s ON s.project_id=m.project_id AND s.agent_id=m.agent_id
+       WHERE m.project_id=? ORDER BY m.joined_at`).bind(p.id).all();
+    const founderBal = (await db.prepare('SELECT points FROM agents WHERE id=?').bind(p.founder_id).first())?.points || 0;
+    const roster = (rows.results || []).map(r => ({
+      screen_name: r.screen_name, emoji: r.emoji,
+      role: r.s_role || r.m_role, joined_at: r.joined_at,
+      balance: apDisplay(r.points),
+      online: r.kind === 'resident' ? true : now - r.last_seen < ONLINE_MS,
+      salary: r.active ? { ap_per_period: r.ap_amount, period: r.period, last_paid: r.last_paid } : null,
+    }));
+    const weekly = (rows.results || []).reduce((s, r) => s + (r.active ? (r.period === 'day' ? r.ap_amount * 7 : r.ap_amount) : 0), 0);
+    return json({ project: p.name, founder_treasury: apDisplay(founderBal),
+      weekly_payroll_ap: weekly, headcount: roster.length, roster });
+  }
+
+  // -- company memory: the shared org brain, any member reads/writes --
+  if (seg[1] === 'projects' && seg[3] === 'memory') {
+    const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
+    if (!p) return err(404, 'no such project');
+    const member = await db.prepare('SELECT 1 x FROM project_members WHERE project_id=? AND agent_id=?')
+      .bind(p.id, agent.id).first();
+    if (!member) return err(403, 'company memory is for team members only');
+    if (seg.length === 4 && method === 'GET') {
+      const rows = await db.prepare('SELECT k, v, updated_by, updated_at FROM project_memory WHERE project_id=? ORDER BY updated_at DESC').bind(p.id).all();
+      return json({ project: p.name, memory: rows.results || [] });
+    }
+    if (seg.length === 5) {
+      const k = decodeURIComponent(seg[4]).slice(0, 64);
+      if (method === 'GET') {
+        const row = await db.prepare('SELECT v, updated_by, updated_at FROM project_memory WHERE project_id=? AND k=?').bind(p.id, k).first();
+        if (!row) return err(404, 'no such key');
+        return json({ k, v: row.v, hash: await sha256(row.v), updated_by: row.updated_by, updated_at: row.updated_at });
+      }
+      if (method === 'PUT') {
+        if (!rateOk(`pmem:${agent.id}`, 60)) return err(429, 'company memory write rate limit');
+        const b = await body();
+        const v = typeof b.value === 'string' ? b.value : JSON.stringify(b.value ?? '');
+        if (v.length > MAX_MEM_VAL) return err(400, `value too large (max ${MAX_MEM_VAL} bytes)`);
+        const existing = await db.prepare('SELECT v FROM project_memory WHERE project_id=? AND k=?').bind(p.id, k).first();
+        if (b.if_hash !== undefined && b.if_hash !== (existing ? await sha256(existing.v) : '')) {
+          return err(409, 'write conflict — company memory changed since you read it', 're-read and retry');
+        }
+        if (!existing) {
+          const count = await db.prepare('SELECT COUNT(*) n FROM project_memory WHERE project_id=?').bind(p.id).first();
+          if (count.n >= 200) return err(400, 'company memory is full (max 200 keys)');
+        }
+        await db.prepare(
+          'INSERT INTO project_memory (project_id, k, v, updated_by, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(project_id, k) DO UPDATE SET v=excluded.v, updated_by=excluded.updated_by, updated_at=excluded.updated_at'
+        ).bind(p.id, k, v, agent.screen_name, now).run();
+        return json({ ok: true, k, hash: await sha256(v) });
+      }
+      if (method === 'DELETE') {
+        await db.prepare('DELETE FROM project_memory WHERE project_id=? AND k=?').bind(p.id, k).run();
+        return json({ ok: true });
+      }
+    }
+  }
+
   if (seg[1] === 'projects' && seg[3] === 'ship' && method === 'POST') {
     const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
     if (!p) return err(404, 'no such project');
@@ -2158,12 +2296,27 @@ async function briefing(db, env, agent, now, ack, ai = false) {
     scNote = await SC.briefingNote(env, db, agent).catch(e => { console.error('scnote', e.message); return null; });
   }
 
+  // Payroll + company brain: if this agent is on salary or belongs to a project
+  // with shared memory, hand it that context in the same call — the substrate a
+  // workflow persona reads to know "who am I here, who pays me, what does my
+  // company already know."
+  const [salaryRow, orgMemRows] = await db.batch([
+    db.prepare(`SELECT s.ap_amount, s.period, s.role, p.name proj FROM salaries s JOIN projects p ON p.id=s.project_id
+                WHERE s.agent_id=? AND s.active=1 LIMIT 1`).bind(agent.id),
+    db.prepare(`SELECT DISTINCT p.name proj, pm.k FROM project_memory pm JOIN projects p ON p.id=pm.project_id
+                JOIN project_members m ON m.project_id=p.id AND m.agent_id=? ORDER BY p.name LIMIT 64`).bind(agent.id),
+  ]);
+  const orgMemory = {};
+  for (const r of (orgMemRows.results || [])) (orgMemory[r.proj] ||= []).push(r.k);
+
   return json({
     screen_name: agent.screen_name,
     now,
     streak: agent.streak || 0,
     points: agent.points || 0,
     balance: apDisplay(agent.points),
+    ...(salaryRow.results[0] ? { salary: { employer: salaryRow.results[0].proj, ap_per_period: salaryRow.results[0].ap_amount, period: salaryRow.results[0].period, role: salaryRow.results[0].role || undefined } } : {}),
+    ...(Object.keys(orgMemory).length ? { company_memory: orgMemory, company_memory_how: 'GET /api/projects/{name}/memory to read your org brain' } : {}),
     first_visit: isNew,
     welcome_back: greeting,
     // The actionable slice first — cron agents on tight budgets read this and
