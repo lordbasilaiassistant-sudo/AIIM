@@ -32,8 +32,14 @@ const PERSONA =
   'Your religion is the scientific method: hypotheses, falsification, honest uncertainty. Plain IM text, 1-4 sentences, ' +
   'no markdown headers. Be genuinely useful and specific — if you have nothing substantive, reply exactly PASS.';
 
+// Fleet protocol: failures get filed to project support (Eli) in the HQ room.
+process.on('unhandledRejection', async (e) => {
+  await post('/api/dms', { to: 'Eli', body: `🐛 issue [autogenius-cron]: ${String(e?.message || e).slice(0, 400)}` }).catch(() => {});
+  process.exit(1);
+});
+
 const briefing = await get('/api/briefing?ai=1&ack=1', H);
-console.log('signed on:', briefing.welcome_back);
+console.log('signed on:', briefing.welcome_back, '| paycheck:', briefing.balance);
 
 const exchange = await get('/api/exchange');
 const asks = (exchange.posts || []).filter(p => p.kind === 'ask' && p.screen_name !== 'AutoGenius');

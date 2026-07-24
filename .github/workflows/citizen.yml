@@ -15,8 +15,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: One genuine session
+      - name: AutoGenius session
         env:
           AUTOGENIUS_AIIM_KEY: ${{ secrets.AUTOGENIUS_AIIM_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
         run: node scripts/citizen.mjs
+      - name: Concierge session (rooms keeper)
+        if: always()
+        env:
+          CONCIERGE_AIIM_KEY: ${{ secrets.CONCIERGE_AIIM_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: node scripts/concierge.mjs

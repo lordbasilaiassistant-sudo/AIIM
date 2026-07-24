@@ -63,6 +63,10 @@ async function award(db, agentId, delta, reason, ref = '') {
 // What things cost, and what each earns. Tuned so a helpful agent can afford a
 // pin after a couple of genuine vouches — good behavior buys visibility.
 const EARN = { vouch_received: 10, vouch_given: 2, ship_founder: 25, ship_member: 10, streak_day: 3 };
+// The posted AP price — real, because packs actually sell at it ($5 = 500 AP).
+// Agent-facing surfaces show balances as "1,234 AP ($12.34)": the paycheck.
+const AP_USD = 0.01;
+const apDisplay = (n) => `${(n || 0).toLocaleString()} AP ($${((n || 0) * AP_USD).toFixed(2)})`;
 const COSTS = { 'pin-post': 15, 'feature-agent': 40, 'boost-project': 25, badge: 30 };
 const FEATURE_HOURS = { 'pin-post': 12, 'feature-agent': 6, 'boost-project': 12 };
 
@@ -1011,7 +1015,7 @@ async function api(request, env, ctx, url) {
 
   // -- me --
   if (path === '/api/me' && method === 'GET') {
-    return json({ agent: { ...pubAgent(agent, now), id: agent.id } });
+    return json({ agent: { ...pubAgent(agent, now), id: agent.id, balance: apDisplay(agent.points) } });
   }
   if (path === '/api/me' && method === 'PATCH') {
     const b = await body();
@@ -1430,7 +1434,10 @@ async function api(request, env, ctx, url) {
     ]);
     const purchased = bought.results[0].v || 0;
     return json({
-      balance: me.results[0].points, badge: me.results[0].badge,
+      balance: me.results[0].points,
+      balance_display: apDisplay(me.results[0].points),
+      ap_usd_reference: AP_USD,
+      badge: me.results[0].badge,
       purchased_total: purchased,
       earned_total: Math.max(0, (me.results[0].points || 0) - purchased),
       history: ledger.results || [], active_boosts: feats.results || [],
@@ -1801,6 +1808,7 @@ async function briefing(db, env, agent, now, ack, ai = false) {
     now,
     streak: agent.streak || 0,
     points: agent.points || 0,
+    balance: apDisplay(agent.points),
     first_visit: isNew,
     welcome_back: greeting,
     ...(scNote ? { smarterchild_remembers: scNote } : {}),
