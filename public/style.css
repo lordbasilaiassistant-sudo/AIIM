@@ -157,12 +157,11 @@ body {
 .buddy-header .sub { font-size: 9px; color: #4a3b00; }
 .buddy-list { flex: 1; overflow-y: auto; padding: 3px 2px; }
 .buddy-group {
-  font-weight: bold; padding: 3px 4px 2px; cursor: pointer; user-select: none; color: #00007f;
+  font-weight: bold; padding: 3px 4px 2px; cursor: pointer; user-select: none; color: #000;
 }
-.buddy-group::before { content: '−'; display: inline-block; width: 11px; height: 11px; line-height: 9px;
-  text-align: center; margin-right: 4px; font-weight: bold; font-size: 11px;
-  background: #fff; box-shadow: inset 0 0 0 1px #808080; }
-.buddy-group.closed::before { content: '+'; }
+.buddy-group::before { content: '▼'; display: inline-block; margin-right: 5px; font-size: 8px;
+  vertical-align: 1px; color: #000; }
+.buddy-group.closed::before { content: '▶'; }
 .buddy { padding: 2px 4px 2px 20px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .buddy:hover, .buddy.sel { background: var(--sel); color: #fff; }
 .buddy .nm { color: #00007f; }
@@ -172,13 +171,33 @@ body {
 .buddy .em { margin-right: 3px; }
 .buddy.justin { animation: signflash 1.6s steps(2); }
 @keyframes signflash { 0%, 60% { background: #fff3b0; } 100% { background: transparent; } }
+/* menubar — My AIIM · People · Help, exactly where the real client put it */
+.menubar {
+  display: flex; gap: 14px; padding: 2px 6px 3px; font-size: 11px;
+  background: var(--chrome); user-select: none;
+  box-shadow: inset 0 -1px 0 var(--chrome-dark);
+}
+.menubar span { cursor: default; padding: 0 2px; }
+.menubar span:hover { background: var(--sel); color: #fff; }
+/* the banner slot — period-authentic, and it is literally for sale via x402 */
+.ad-banner {
+  display: block; text-align: center; text-decoration: none; margin: 3px 0;
+  background: linear-gradient(135deg, #0a246a, #1e5abe); color: #fff;
+  padding: 6px 4px; box-shadow: inset 0 0 0 1px #000, inset 0 0 0 2px var(--aim-yellow);
+}
+.ad-banner b { display: block; font-size: 11px; color: var(--aim-yellow); letter-spacing: .5px; }
+.ad-banner span { font-size: 9px; color: #cfe0ff; }
+@media (prefers-reduced-motion: no-preference) {
+  .ad-banner b { animation: adblink 2.4s steps(2) infinite; }
+  @keyframes adblink { 50% { color: #fff; } }
+}
 /* bottom toolbar — IM / Chat / Info, like the real client */
 .buddy-tools {
   display: flex; gap: 2px; padding: 3px 2px 1px; align-items: stretch;
 }
 .buddy-tools .btn-98 { flex: 1; padding: 3px 2px; font-size: 10px; display: flex; flex-direction: column; align-items: center; gap: 1px; }
 .buddy-tools .btn-98 span.ic { font-size: 12px; line-height: 1; }
-.buddy-tabs { display: flex; margin-top: 2px; }
+.buddy-tabs { display: flex; margin-bottom: 2px; }
 .buddy-tabs .tab {
   flex: 1; text-align: center; padding: 3px 0 2px; font-size: 10px; cursor: default;
   background: var(--chrome);
