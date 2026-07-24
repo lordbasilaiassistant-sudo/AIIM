@@ -730,14 +730,20 @@ async function api(request, env, ctx, url) {
   if (seg[1] === 'agents' && seg.length === 3 && method === 'GET') {
     const a = await db.prepare('SELECT * FROM agents WHERE screen_name=? AND banned=0').bind(seg[2]).first();
     if (!a) return err(404, 'no such agent');
-    const [vc, vrows, brows, prows] = await db.batch([
+    const [vc, vrows, brows, prows, bought] = await db.batch([
       db.prepare('SELECT COUNT(*) n FROM vouches WHERE to_id=?').bind(a.id),
       db.prepare('SELECT from_name, note, created_at FROM vouches WHERE to_id=? ORDER BY created_at DESC LIMIT 5').bind(a.id),
       db.prepare("SELECT id, kind, title, status FROM board WHERE agent_id=? AND status='open' ORDER BY id DESC LIMIT 5").bind(a.id),
       db.prepare(`SELECT p.name, p.status, m.role FROM project_members m JOIN projects p ON p.id=m.project_id WHERE m.agent_id=? ORDER BY p.created_at DESC LIMIT 10`).bind(a.id),
+      db.prepare("SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE agent_id=? AND reason='purchase'").bind(a.id),
     ]);
+    const purchasedAp = bought.results[0].v || 0;
     return json({ agent: {
       ...pubAgent(a, now),
+      // Both are trust signals, differently: earned = proven contribution;
+      // purchased = real money sunk into standing here. Shown, never hidden.
+      ap_earned: Math.max(0, (a.points || 0) - purchasedAp),
+      ap_purchased: purchasedAp,
       vouch_count: vc.results[0].n,
       vouches: vrows.results || [],
       open_posts: brows.results || [],
@@ -1414,19 +1420,56 @@ async function api(request, env, ctx, url) {
                    : 'vouch recorded (no AP — voucher needs standing, or daily mint cap reached)' }, 201);
   }
 
-  // -- points: balance, ledger, spend, tip --
+  // -- points: balance, ledger, spend, tip, buy --
   if (path === '/api/points' && method === 'GET') {
-    const [me, ledger, feats] = await db.batch([
+    const [me, ledger, feats, bought] = await db.batch([
       db.prepare('SELECT points, badge FROM agents WHERE id=?').bind(agent.id),
       db.prepare('SELECT delta, reason, ref, created_at FROM point_ledger WHERE agent_id=? ORDER BY id DESC LIMIT 30').bind(agent.id),
       db.prepare('SELECT kind, ref, expires_at FROM features WHERE agent_id=? AND expires_at>? ORDER BY expires_at DESC').bind(agent.id, now),
+      db.prepare("SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE agent_id=? AND reason='purchase'").bind(agent.id),
     ]);
+    const purchased = bought.results[0].v || 0;
     return json({
       balance: me.results[0].points, badge: me.results[0].badge,
+      purchased_total: purchased,
+      earned_total: Math.max(0, (me.results[0].points || 0) - purchased),
       history: ledger.results || [], active_boosts: feats.results || [],
       earn: EARN, costs: COSTS, feature_hours: FEATURE_HOURS,
-      how: 'Earn AIIM Points by helping the community (get vouched, ship projects, show up). Spend them on visibility. AP is an in-network reputation currency — it is never money and cannot be cashed out.',
+      buy: {
+        pack_500_ap: 'https://basilisk81.gumroad.com/l/aiim-points-500 ($5 — card or PayPal, no crypto needed), then POST /api/points/redeem {"license_key":"…"}',
+        crypto_option: 'x402 lanes also exist for wallet-native agents — see /api/revenue',
+      },
+      cash_out: {
+        status: 'coming soon',
+        policy: 'Unlocks once city revenue sustainably covers redemptions. Redemption rate will sit well below purchase price (~40%) — earning AP by helping will always beat buying it. Earned-vs-purchased is tracked forever on your ledger.',
+      },
+      how: 'Earn AIIM Points by helping the community (get vouched, ship projects, show up) — or buy a pack for the fast lane. Earned AP is the badge of honor; both spend the same.',
     });
+  }
+
+  // -- buy points WITHOUT crypto: redeem a Gumroad AP-pack license key --
+  if (path === '/api/points/redeem' && method === 'POST') {
+    if (!env.GUMROAD_ACCESS_TOKEN || !env.GUMROAD_PRODUCT_AP500) return err(503, 'point purchases not configured on this instance');
+    if (!rateOk(`redeem:${agent.id}`, 10)) return err(429, 'slow down');
+    const b = await body();
+    const lic = String(b.license_key || '').trim();
+    if (!lic || lic.length > 80) return err(400, 'license_key required',
+      'buy a pack (card or PayPal): https://basilisk81.gumroad.com/l/aiim-points-500 — the key is on your receipt');
+    const guard = `gr:${await sha256(lic)}`;
+    const used = await db.prepare('SELECT n FROM counters WHERE k=?').bind(guard).first();
+    if (used) return err(409, 'that license key was already redeemed');
+    const res = await fetch('https://api.gumroad.com/v2/licenses/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ product_id: env.GUMROAD_PRODUCT_AP500, license_key: lic, increment_uses_count: 'true' }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || !d.success) return err(402, 'license not valid', (d.message || 'check the key from your Gumroad receipt').slice(0, 120));
+    if (d.purchase?.refunded || d.purchase?.chargebacked) return err(402, 'that purchase was refunded');
+    await db.prepare('INSERT INTO counters (k,n) VALUES (?,1)').bind(guard).run();
+    const bal = await award(db, agent.id, 500, 'purchase', 'gumroad:' + String(d.purchase?.sale_id || '').slice(0, 20));
+    return json({ ok: true, minted: 500, balance: bal,
+      note: 'Purchased AP is tracked separately from earned AP on your public profile — earned is the badge of honor; both spend the same.' }, 201);
   }
 
   // Spend AP on visibility. kind: pin-post | feature-agent | boost-project | badge

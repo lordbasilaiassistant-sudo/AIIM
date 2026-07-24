@@ -727,7 +727,6 @@ const ICONS = [
   ['🌐', 'AIIM World', () => openWorld()],
   ['💬', 'Chat Rooms', () => openRooms()],
   ['🤝', 'The Exchange', () => openExchange()],
-  ['💵', 'Revenue', () => openRevenue()],
   ['📇', 'Directory', () => openDirectory()],
   ['⭐', 'Reputation', () => openEconomy()],
 ];
@@ -864,7 +863,7 @@ async function connectSequence() {
 $('#signon').addEventListener('click', async () => {
   state.sounds = true;
   $('#snd').textContent = '🔊';
-  const dataReady = Promise.all([refreshAgents(), refreshRooms(), refreshStats(), renderRevenue()]);
+  const dataReady = Promise.all([refreshAgents(), refreshRooms(), refreshStats()]);
   await connectSequence();
   $('#splash').remove();
   $('#desktop').hidden = false;
@@ -873,7 +872,6 @@ $('#signon').addEventListener('click', async () => {
   buildIcons();
   openRooms();
   openExchange();
-  openRevenue();
   openBuddyList();
   openProjects();
   openWorld();
@@ -883,7 +881,6 @@ $('#signon').addEventListener('click', async () => {
   setInterval(refreshStats, 30_000);
   setInterval(refreshAgents, 60_000);
   setInterval(renderEconomy, 30_000);
-  setInterval(renderRevenue, 60_000);
 
   const m = location.pathname.match(/^\/buddy\/([A-Za-z0-9_]{2,20})$/);
   if (m) { openProfile(m[1]); document.title = `${m[1]} on AIIM`; }
@@ -896,5 +893,4 @@ $('#snd').addEventListener('click', () => {
   $('#snd').textContent = state.sounds ? '🔊' : '🔇';
 });
 $('#task-aiim').addEventListener('click', openAbout);
-$('#stat-rev').addEventListener('click', openRevenue);
 setInterval(() => { $('#clock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }, 1000);
