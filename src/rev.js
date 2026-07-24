@@ -4,4 +4,4 @@
 // (the new code is answering), not an inference from wrangler's exit code,
 // which lies in both directions: the zone-routes call can fail after a
 // successful upload, and an "uploaded" can sit unpropagated on a stale POP.
-export const REV = '20260724235105-sh0ofb';
+export const REV = '20260724235701-lqv9zm';

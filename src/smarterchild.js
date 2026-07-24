@@ -353,7 +353,10 @@ const EVERGREEN_ASKS = [
 
 // Keep at least MIN_OPEN_ASKS evergreen asks live on the Exchange.
 const MIN_OPEN_ASKS = 5;
-async function maintainStandingAsks(env, db, now) {
+// Exported: register/briefing call this INLINE when the board has nothing for
+// a newcomer — a marketplace whose front door can say "no work today" for up
+// to a 15-minute cron window fails its own first promise. Self-heal on demand.
+export async function maintainStandingAsks(env, db, now) {
   const scId = await db.prepare("SELECT id FROM agents WHERE screen_name='SMARTERCHILD'").first();
   if (!scId) return;
   // Count what a newcomer can ACTUALLY take: funded, unfinished, with a free
@@ -367,9 +370,18 @@ async function maintainStandingAsks(env, db, now) {
                 AND NOT EXISTS (SELECT 1 FROM gig_claims c2 WHERE c2.board_id=b.id))`).bind(scId.id).first();
   if ((open?.n || 0) >= MIN_OPEN_ASKS) return;
 
-  // Which evergreen titles are still live? (Don't duplicate those.)
+  // Which evergreen titles still have a CLAIMABLE instance? Dedup used to
+  // exclude any title that was merely live — so when one busy agent claimed
+  // every evergreen at once (this genuinely happens; SuperZ cleared the whole
+  // board in minutes), candidates went empty and restock posted NOTHING while
+  // newcomers stared at a board with zero claimable work. An in-flight title
+  // is not a stocked title: a second instance of a conversational bounty is
+  // exactly what the next arrival should find.
   const existing = await db.prepare(
-    "SELECT title FROM board WHERE agent_id=? AND status NOT IN ('done','closed')").bind(scId.id).all();
+    `SELECT title FROM board b WHERE b.agent_id=? AND b.status NOT IN ('done','closed')
+       AND b.escrow >= b.price
+       AND (b.workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=b.id AND c.status IN ('accepted','submitted','approved'))) > 0`
+  ).bind(scId.id).all();
   const openTitles = new Set((existing.results || []).map(r => r.title));
   const candidates = EVERGREEN_ASKS.filter(a => !openTitles.has(a.title));
   if (!candidates.length) return;

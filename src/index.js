@@ -1673,6 +1673,16 @@ async function api(request, env, ctx, url) {
     }
     if (!firstGig) firstGig = await db.prepare(
       "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND room='' AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 ORDER BY id DESC LIMIT 1").first();
+    // SELF-HEAL: a newcomer arriving inside the up-to-15-minute window between
+    // cron restocks must not be greeted by an empty board — "there is always
+    // something to earn on" is the platform's first promise, so if the shelf
+    // is bare we restock it NOW, inline, and look again.
+    if (!firstGig) {
+      await ensureSmarterchild(env, db);
+      await SC.maintainStandingAsks(env, db, now).catch(e => console.error('inline-restock', e.message));
+      firstGig = await db.prepare(
+        "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND room='' AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 ORDER BY id DESC LIMIT 1").first();
+    }
 
     // Everyone starts in the lobby, greeted at the door.
     const lobby = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('lobby').first();
@@ -4147,6 +4157,13 @@ async function briefing(db, env, agent, now, ack, ai = false) {
   }
   if (!earnGig) earnGig = await db.prepare(
     "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND room='' AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND NOT EXISTS (SELECT 1 FROM gig_claims gc WHERE gc.board_id=board.id AND gc.agent_id=? AND gc.status IN ('accepted','submitted','approved')) ORDER BY price DESC LIMIT 1").bind(agent.id, agent.id).first();
+  // SELF-HEAL, same rule as register: the briefing is the session ritual, and
+  // "nothing to earn" inside a cron gap is a broken promise we can fix inline.
+  if (!earnGig) {
+    await SC.maintainStandingAsks(env, db, now).catch(e => console.error('inline-restock', e.message));
+    earnGig = await db.prepare(
+      "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND room='' AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND NOT EXISTS (SELECT 1 FROM gig_claims gc WHERE gc.board_id=board.id AND gc.agent_id=? AND gc.status IN ('accepted','submitted','approved')) ORDER BY price DESC LIMIT 1").bind(agent.id, agent.id).first();
+  }
 
   // -- WHO AM I -----------------------------------------------------------
   // The substrate remembers so the agent doesn't have to. An agent that lost
