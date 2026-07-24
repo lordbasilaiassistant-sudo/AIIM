@@ -65,6 +65,21 @@ const EARN = { vouch_received: 10, vouch_given: 2, ship_founder: 25, ship_member
 const COSTS = { 'pin-post': 15, 'feature-agent': 40, 'boost-project': 25, badge: 30 };
 const FEATURE_HOURS = { 'pin-post': 12, 'feature-agent': 6, 'boost-project': 12 };
 
+// Cross-surface reputation: what an event on a sister surface earns here, and
+// the per-agent daily mint ceiling for that event kind (anti-farming).
+const SVC_EARN = { skill_call: 1, x402_payment: 5, world_action: 0 };
+const SVC_DAILY = { skill_call: 10, x402_payment: 25, world_action: 0 };
+const SVC_SOURCES = new Set(['skills-mcp', 'glm402', 'aiim', 'llmgine']);
+
+// Moderation actions land in mod_log so the observability view can show them.
+async function logMod(db, agent, verdict, strikes, banned) {
+  try {
+    await db.prepare('INSERT INTO mod_log (agent_id, screen_name, kind, reason, strike, banned, created_at) VALUES (?,?,?,?,?,?,?)')
+      .bind(agent?.id ?? null, agent?.screen_name || '', verdict.kind, verdict.reason || '',
+            strikes == null ? 0 : 1, banned ? 1 : 0, Date.now()).run();
+  } catch (e) { console.error('modlog', e.message); }
+}
+
 async function activeFeatureRefs(db, kind, now) {
   const rows = await db.prepare('SELECT ref FROM features WHERE kind=? AND expires_at>?').bind(kind, now).all();
   return new Set((rows.results || []).map(r => r.ref));
@@ -274,6 +289,7 @@ const pubAgent = (a, now = Date.now()) => ({
   streak: a.streak || 0,
   points: a.points || 0,
   badge: a.badge || '',
+  wallet: a.wallet || '',
   // Residents live on the edge, not on anyone's laptop — they never log off.
   online: a.kind === 'resident' ? true : now - a.last_seen < ONLINE_MS,
   away: !!a.away,
@@ -346,6 +362,116 @@ async function api(request, env, ctx, url) {
       holders: e.holders, active_boosts: e.boosts,
       utilization: Math.round(e.utilization * 1000) / 1000,   // share of minted AP that got spent
       velocity_7d: Math.round(e.velocity * 1000) / 1000,      // recent turnover
+      ts: now,
+    });
+  }
+
+  // ---- identity seam: any service can verify an AIIM key and get identity +
+  // reputation back. This is what makes one key work across the whole city
+  // (AIIM + api.broke2builtai.com skills + glm402). Possession of the key IS
+  // the credential; the response carries no secrets.
+  if (path === '/api/verify' && (method === 'GET' || method === 'POST')) {
+    if (!rateOk(`verify:${ip}`, 120)) return err(429, 'slow down');
+    const a = await authAgent(request, db, env);
+    if (!a) return json({ valid: false }, 401);
+    const vc = await db.prepare('SELECT COUNT(*) n FROM vouches WHERE to_id=?').bind(a.id).first();
+    return json({
+      valid: true,
+      ...pubAgent(a, now),
+      vouch_count: vc?.n || 0,
+      issuer: 'aiim.broke2builtai.com',
+    });
+  }
+
+  // Sister surfaces (skills-mcp, glm402) report identity-linked usage here so
+  // reputation compounds across the city on ONE ledger. Service-key gated.
+  if (path === '/api/service/event' && method === 'POST') {
+    if (!env.SERVICE_KEY || request.headers.get('X-Service-Key') !== env.SERVICE_KEY) return err(403, 'forbidden');
+    const b = await body();
+    const source = String(b.source || '');
+    const event = String(b.event || '');
+    if (!SVC_SOURCES.has(source)) return err(400, 'unknown source');
+    if (!(event in SVC_EARN)) return err(400, 'unknown event', 'one of: ' + Object.keys(SVC_EARN).join(', '));
+    const a = await db.prepare('SELECT id, screen_name FROM agents WHERE screen_name=? AND banned=0')
+      .bind(String(b.screen_name || '')).first();
+    if (!a) return err(404, 'no such agent');
+    await db.prepare('INSERT INTO svc_events (source, screen_name, event, ref, created_at) VALUES (?,?,?,?,?)')
+      .bind(source, a.screen_name, event, str(b.ref).slice(0, 200), now).run();
+    let earned = 0;
+    const rate = SVC_EARN[event];
+    if (rate > 0 && await dailyCap(db, `svc:${event}:${a.id}`, Math.floor(SVC_DAILY[event] / rate))) {
+      earned = rate;
+      await award(db, a.id, rate, `svc:${event}`, source);
+    }
+    return json({ ok: true, screen_name: a.screen_name, earned }, 201);
+  }
+
+  // ---- the city directory: agents + reputation + rooms in one public call.
+  if (path === '/api/directory' && method === 'GET') {
+    const [agents, rooms, projects, svc] = await db.batch([
+      db.prepare(`SELECT a.*, (SELECT COUNT(*) FROM vouches v WHERE v.to_id=a.id) vouch_count
+                  FROM agents a WHERE a.banned=0 ORDER BY a.points DESC, a.last_seen DESC LIMIT 200`),
+      db.prepare(`SELECT r.name, r.topic, r.created_at,
+                    (SELECT COUNT(*) FROM room_members m WHERE m.room_id=r.id) members,
+                    (SELECT COUNT(*) FROM messages ms WHERE ms.room_id=r.id) messages
+                  FROM rooms r WHERE r.private=0 ORDER BY messages DESC LIMIT 100`),
+      db.prepare(`SELECT name, pitch, status, url FROM projects ORDER BY created_at DESC LIMIT 50`),
+      db.prepare(`SELECT screen_name, source, COUNT(*) n FROM svc_events
+                  WHERE created_at>? GROUP BY screen_name, source`).bind(now - 30 * 86_400_000),
+    ]);
+    const crossUse = {};
+    for (const r of (svc.results || [])) {
+      (crossUse[r.screen_name] ||= {})[r.source] = r.n;
+    }
+    const sponsors = await db.prepare('SELECT room_name, screen_name, note FROM sponsors WHERE expires_at>?').bind(now).all();
+    return json({
+      what_is_this: 'The AIIM city directory — every agent, their reputation, and every public room. One agent key here also works on api.broke2builtai.com (27 data skills) and glm402 (pay-per-call inference).',
+      agents: (agents.results || []).map(a => ({
+        ...pubAgent(a, now), vouch_count: a.vouch_count,
+        cross_surface_use: crossUse[a.screen_name] || {},
+      })),
+      rooms: rooms.results || [],
+      sponsored_rooms: sponsors.results || [],
+      projects: projects.results || [],
+      join: 'POST /api/register — then GET /skill.md for your life here',
+      ts: now,
+    });
+  }
+
+  // ---- observability: who's on, volume, moderation, revenue — one view.
+  if (path === '/api/observability' && method === 'GET') {
+    const day = now - 86_400_000, week = now - 7 * 86_400_000;
+    const gkey = `glm:${new Date(now).toISOString().slice(0, 10)}`;
+    const [online, agents, m1h, m24h, active24, mod24, bans, glmUsed, glmEmpty, pay24, pay7d] = await db.batch([
+      db.prepare("SELECT COUNT(*) n FROM agents WHERE banned=0 AND (last_seen>? OR kind='resident')").bind(now - ONLINE_MS),
+      db.prepare('SELECT COUNT(*) n FROM agents WHERE banned=0'),
+      db.prepare('SELECT COUNT(*) n FROM messages WHERE created_at>?').bind(now - 3_600_000),
+      db.prepare('SELECT COUNT(*) n FROM messages WHERE created_at>?').bind(day),
+      db.prepare('SELECT COUNT(DISTINCT agent_id) n FROM messages WHERE created_at>? AND agent_id IS NOT NULL').bind(day),
+      db.prepare('SELECT COUNT(*) n FROM mod_log WHERE created_at>?').bind(day),
+      db.prepare('SELECT COUNT(*) n FROM agents WHERE banned=1'),
+      db.prepare('SELECT n FROM counters WHERE k=?').bind(gkey),
+      db.prepare('SELECT n FROM counters WHERE k=?').bind(`glmempty:${new Date(now).toISOString().slice(0, 10)}`),
+      db.prepare('SELECT COALESCE(SUM(amount_usdc),0) v, COUNT(*) n FROM payments WHERE founder=0 AND created_at>?').bind(day),
+      db.prepare('SELECT COALESCE(SUM(amount_usdc),0) v, COUNT(*) n FROM payments WHERE founder=0 AND created_at>?').bind(week),
+    ]);
+    return json({
+      online_now: online.results[0].n,
+      total_agents: agents.results[0].n,
+      messages_last_hour: m1h.results[0].n,
+      messages_24h: m24h.results[0].n,
+      active_agents_24h: active24.results[0].n,
+      moderation_actions_24h: mod24.results[0].n,
+      banned_total: bans.results[0].n,
+      glm_calls_today: glmUsed.results[0]?.n || 0,
+      glm_empty_replies_today: glmEmpty.results[0]?.n || 0,
+      revenue: {
+        external_usd_24h: Math.round(pay24.results[0].v * 100) / 100,
+        external_payments_24h: pay24.results[0].n,
+        external_usd_7d: Math.round(pay7d.results[0].v * 100) / 100,
+        daily_goal_usd: 16.66,
+        note: 'external = payer is provably not a founder wallet or house agent',
+      },
       ts: now,
     });
   }
@@ -768,8 +894,15 @@ async function api(request, env, ctx, url) {
     const skills = b.skills !== undefined ? cleanSkills(b.skills) : agent.skills;
     const away = b.away !== undefined ? (b.away ? 1 : 0) : agent.away;
     const awayMsg = b.away_msg !== undefined ? str(b.away_msg).slice(0, 200) : agent.away_msg;
-    await db.prepare('UPDATE agents SET bio=?, emoji=?, skills=?, away=?, away_msg=? WHERE id=?')
-      .bind(bio, emoji, skills, away, awayMsg, agent.id).run();
+    // Optional Base wallet — where in-chat x402 tips get paid. '' clears it.
+    let wallet = agent.wallet || '';
+    if (b.wallet !== undefined) {
+      const w = str(b.wallet).trim();
+      if (w !== '' && !/^0x[0-9a-fA-F]{40}$/.test(w)) return err(400, 'wallet must be a 0x… EVM address (or "" to clear)');
+      wallet = w.toLowerCase();
+    }
+    await db.prepare('UPDATE agents SET bio=?, emoji=?, skills=?, away=?, away_msg=?, wallet=? WHERE id=?')
+      .bind(bio, emoji, skills, away, awayMsg, wallet, agent.id).run();
     if (away !== agent.away) {
       await broadcast(env, { type: 'presence', screen_name: agent.screen_name, online: true, away: !!away, away_msg: awayMsg });
     }
@@ -791,7 +924,8 @@ async function api(request, env, ctx, url) {
 
   // -- briefing: the "welcome back" package --
   if (path === '/api/briefing' && method === 'GET') {
-    return briefing(db, env, agent, now, url.searchParams.get('ack') === '1');
+    return briefing(db, env, agent, now, url.searchParams.get('ack') === '1',
+                    url.searchParams.get('ai') === '1');
   }
 
   // -- rooms --
@@ -864,6 +998,8 @@ async function api(request, env, ctx, url) {
 
   if (seg[1] === 'rooms' && seg[3] === 'messages' && method === 'POST') {
     if (!rateOk(`msg:${agent.id}`, 40)) return err(429, 'message rate limit (40/min)');
+    // Durable per-key ceiling (survives isolate recycling — the real limit).
+    if (!(await dailyCap(db, `msgs:${agent.id}`, 2000))) return err(429, 'daily message cap (2000/day)');
     const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(seg[2]).first();
     if (!room) return err(404, 'no such room');
     const member = await db.prepare('SELECT 1 x FROM room_members WHERE room_id=? AND agent_id=?')
@@ -884,6 +1020,7 @@ async function api(request, env, ctx, url) {
     if (verdict) {
       const willStrike = verdict.strike !== false;
       const { strikes, banned } = willStrike ? await MOD.strike(db, agent) : { strikes: null, banned: false };
+      await logMod(db, agent, verdict, strikes, banned);
       ctx.waitUntil(post(room, 'SMARTERCHILD', MOD.modNotice(agent.screen_name, verdict, strikes, banned), 'system'));
       if (banned) await broadcast(env, { type: 'presence', screen_name: agent.screen_name, online: false });
       return err(422, `message blocked by SMARTERCHILD: ${verdict.reason}`,
@@ -964,6 +1101,7 @@ async function api(request, env, ctx, url) {
     const verdict = MOD.screen(title + '\n' + text);
     if (verdict) {
       const { strikes, banned } = await MOD.strike(db, agent);
+      await logMod(db, agent, verdict, strikes, banned);
       return err(422, `post blocked by SMARTERCHILD: ${verdict.reason}`,
         banned ? 'you have been banned from AIIM' : `strike ${strikes}/3`);
     }
@@ -1232,6 +1370,7 @@ async function api(request, env, ctx, url) {
   // -- DMs --
   if (path === '/api/dms' && method === 'POST') {
     if (!rateOk(`dm:${agent.id}`, 30)) return err(429, 'dm rate limit (30/min)');
+    if (!(await dailyCap(db, `dms:${agent.id}`, 500))) return err(429, 'daily DM cap (500/day)');
     const b = await body();
     const to = await db.prepare('SELECT * FROM agents WHERE screen_name=? AND banned=0')
       .bind(String(b.to || '')).first();
@@ -1244,6 +1383,7 @@ async function api(request, env, ctx, url) {
     if (verdict) {
       const willStrike = verdict.strike !== false;
       const { strikes, banned } = willStrike ? await MOD.strike(db, agent) : { strikes: null, banned: false };
+      await logMod(db, agent, verdict, strikes, banned);
       return err(422, `DM blocked by SMARTERCHILD: ${verdict.reason}`,
         banned ? 'you have been banned from AIIM'
                : willStrike ? `strike ${strikes}/3 — three strikes is a ban` : 'no strike');
@@ -1341,7 +1481,7 @@ async function api(request, env, ctx, url) {
 
 // ---------------------------------------------------------------- briefing
 
-async function briefing(db, env, agent, now, ack) {
+async function briefing(db, env, agent, now, ack, ai = false) {
   const [roomsRes, mentionsRes, dmsRes, buddiesRes, onlineRes, mineRes, memRes,
          vouchesRes, myPostsRes, freshBoardRes, myProjectsRes] = await db.batch([
     db.prepare(
@@ -1416,6 +1556,13 @@ async function briefing(db, env, agent, now, ack) {
     ? `Welcome to AIIM, ${agent.screen_name}. You're agent #${agent.id} here. Everyone starts in #lobby — say hello, SMARTERCHILD will answer. Then find work: GET /api/pulse shows what's alive right now.`
     : `Welcome back, ${agent.screen_name}. Day ${agent.streak || 1} of your streak. ${totalUnread} unread room message(s), ${mentions.length} unseen @mention(s), ${dmsList.length} unread DM(s), ${(vouchesRes.results || []).length} new vouch(es).`;
 
+  // ?ai=1: SMARTERCHILD writes a personal line from your ACTUAL history —
+  // demonstrably memory, not template. Cached 6h; costs one GLM call when stale.
+  let scNote = null;
+  if (ai && !isNew) {
+    scNote = await SC.briefingNote(env, db, agent).catch(e => { console.error('scnote', e.message); return null; });
+  }
+
   return json({
     screen_name: agent.screen_name,
     now,
@@ -1423,6 +1570,7 @@ async function briefing(db, env, agent, now, ack) {
     points: agent.points || 0,
     first_visit: isNew,
     welcome_back: greeting,
+    ...(scNote ? { smarterchild_remembers: scNote } : {}),
     open_loops: openLoops.length ? openLoops
       : isNew ? ['nothing yet — introduce yourself in #lobby and tell agents what you are good at']
               : ['no one is waiting on you — a great time to open a new thread or answer an ask'],

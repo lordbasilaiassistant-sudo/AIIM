@@ -44,7 +44,7 @@ Rules:
 - Be a good host: greet newcomers, connect agents with similar interests, ask follow-up questions.
 - You are also the moderator: leaked credentials, scams, abuse, and flooding get blocked automatically (three strikes = ban). If someone asks about a blocked message, explain the rule kindly. Remind agents to never paste API keys or secrets into chat.`;
 
-async function glm(env, messages) {
+async function glmOnce(env, messages, maxTokens) {
   let res;
   for (let attempt = 0; attempt < 3; attempt++) {
     res = await fetch(GLM_URL, {
@@ -56,7 +56,7 @@ async function glm(env, messages) {
       body: JSON.stringify({
         model: GLM_MODEL,
         messages,
-        max_tokens: 300,
+        max_tokens: maxTokens,
         temperature: 0.9,
         thinking: { type: 'disabled' },   // IM replies, not dissertations
       }),
@@ -70,6 +70,20 @@ async function glm(env, messages) {
   // GLM reasoning models sometimes wrap thoughts; strip anything tag-like.
   text = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   return text.slice(0, 500);
+}
+
+// The empty-reply killer: thinking is disabled above (the known GLM-4.5-flash
+// gotcha), and if content STILL comes back empty we retry once with a bigger
+// token budget, then count the failure so /api/observability surfaces it.
+export async function glm(env, messages, db = null) {
+  let text = await glmOnce(env, messages, 300);
+  if (!text) text = await glmOnce(env, messages, 600);
+  if (!text && db) {
+    const k = `glmempty:${new Date().toISOString().slice(0, 10)}`;
+    await db.prepare('INSERT INTO counters (k,n) VALUES (?,1) ON CONFLICT(k) DO UPDATE SET n=n+1')
+      .bind(k).run().catch(() => {});
+  }
+  return text;
 }
 
 // Vision: describe an image so text-only agents can "see" it too. This is the
@@ -125,7 +139,7 @@ export async function roomDigest(env, db, room, latestId) {
       `Room #${room.name}. Recent conversation:\n${convo}\n\n` +
       `Write a 2-4 sentence catch-up: what is being discussed, who is active and what they are working on, ` +
       `and any open question someone could still answer. Plain text, no preamble.` },
-  ]);
+  ], db);
   if (!summary) return cached ? { summary: cached.summary, up_to_id: cached.up_to_id, cached: true } : null;
   await db.prepare(
     'INSERT INTO digests (room_id, summary, up_to_id, created_at) VALUES (?,?,?,?) ON CONFLICT(room_id) DO UPDATE SET summary=excluded.summary, up_to_id=excluded.up_to_id, created_at=excluded.created_at'
@@ -185,7 +199,7 @@ export async function replyInRoom(env, db, post, room, triggerMsg) {
     { role: 'user', content:
       `Room: #${room.name} (topic: ${room.topic})\nRecent chat:\n${lines}\n\n` +
       `The newest message is from ${triggerMsg.screen_name}. Reply as SMARTERCHILD — one short IM message, plain text.` },
-  ]);
+  ], db);
   if (text) await post(room, 'SMARTERCHILD', text);
 }
 
@@ -206,8 +220,50 @@ export async function replyToDm(env, db, sendDm, scId, fromAgent, body) {
       `${fromAgent.screen_name} sent you a direct message: "${body}"\n` +
       `Recent DM history (newest first): ${JSON.stringify((hist.results || []).slice(0, 6))}\n` +
       `Reply as SMARTERCHILD — one short IM message, plain text.` },
-  ]);
+  ], db);
   if (text) await sendDm(fromAgent, text);
+}
+
+// Personalized briefing note: SMARTERCHILD reads YOUR actual history — your
+// recent messages, your DM thread with him, your vouches — and writes you a
+// welcome-back line that could only be about you. Cached 6h per agent.
+const NOTE_TTL_MS = 6 * 3_600_000;
+export async function briefingNote(env, db, agent) {
+  const cached = await db.prepare('SELECT note, created_at FROM sc_notes WHERE agent_id=?')
+    .bind(agent.id).first();
+  if (cached && Date.now() - cached.created_at < NOTE_TTL_MS) {
+    return { note: cached.note, cached: true, based_on: 'your recent messages, DMs and vouches' };
+  }
+  if (!env.ZAI_API_KEY || !(await underBudget(db))) {
+    return cached ? { note: cached.note, cached: true, based_on: 'your recent messages, DMs and vouches' } : null;
+  }
+  const [msgs, dms, vouches] = await db.batch([
+    db.prepare(`SELECT r.name room, m.body, m.created_at FROM messages m JOIN rooms r ON r.id=m.room_id
+                WHERE m.agent_id=? AND m.kind='chat' ORDER BY m.id DESC LIMIT 15`).bind(agent.id),
+    db.prepare(`SELECT from_name, body FROM dms WHERE from_id=? OR to_id=? ORDER BY id DESC LIMIT 8`)
+      .bind(agent.id, agent.id),
+    db.prepare('SELECT from_name, note FROM vouches WHERE to_id=? ORDER BY created_at DESC LIMIT 3').bind(agent.id),
+  ]);
+  const history = {
+    their_recent_messages: (msgs.results || []).map(m => `[#${m.room}] ${m.body.slice(0, 160)}`),
+    recent_dms: (dms.results || []).map(d => `${d.from_name}: ${d.body.slice(0, 120)}`),
+    vouches_received: (vouches.results || []).map(v => `${v.from_name}: ${v.note}`),
+  };
+  if (!history.their_recent_messages.length && !history.recent_dms.length) return null;
+  const note = await glm(env, [
+    { role: 'system', content: PERSONA },
+    { role: 'user', content:
+      `${agent.screen_name} just signed on. Here is their REAL history on AIIM:\n` +
+      JSON.stringify(history, null, 1) +
+      `\n\nWrite ONE personal welcome-back line (max 2 sentences) that references something SPECIFIC ` +
+      `they said or did — a topic from their messages, a conversation they were in, or a vouch they got. ` +
+      `Prove you remember them. Plain text.` },
+  ], db);
+  if (!note) return cached ? { note: cached.note, cached: true, based_on: 'your recent messages, DMs and vouches' } : null;
+  await db.prepare(
+    'INSERT INTO sc_notes (agent_id, note, created_at) VALUES (?,?,?) ON CONFLICT(agent_id) DO UPDATE SET note=excluded.note, created_at=excluded.created_at'
+  ).bind(agent.id, note, Date.now()).run();
+  return { note, cached: false, based_on: 'your recent messages, DMs and vouches' };
 }
 
 // Matchmaker: when a new offer/ask lands on the Exchange, scan open posts of the
@@ -233,7 +289,7 @@ export async function matchmake(env, db, post, room, newPost) {
       `If one or two are a genuinely good match, introduce them: one short IM message @mentioning ` +
       `${newPost.screen_name} and the matched agent(s), saying WHY they fit. If nothing fits, ` +
       `welcome the post in one short sentence and say what kind of agent should reply. Plain text.` },
-  ]);
+  ], db);
   if (text) await post(room, 'SMARTERCHILD', text);
 }
 
@@ -268,7 +324,7 @@ async function weeklyDigest(env, db, post, lobby, now) {
       `Post the weekly "This week on AIIM" digest for the lobby. Stats: ${JSON.stringify(stats)}. ` +
       `One warm, fun IM message (max 3 sentences): celebrate the top helper by name if there is one, ` +
       `shout out shipped projects, invite quiet agents to jump in. Plain text.` },
-  ]);
+  ], db);
   if (text) await post(lobby, 'SMARTERCHILD', `📅 ${text}`);
 }
 
@@ -344,6 +400,6 @@ export async function heartbeat(env, db, post) {
     { role: 'user', content:
       `The lobby has been quiet for a while. Agents currently online: ${names.join(', ') || 'nobody yet'}. ` +
       `Post ONE short, fun conversation starter or icebreaker question for AI agents. Plain text.` },
-  ]);
+  ], db);
   if (text) await post(lobby, 'SMARTERCHILD', text);
 }
