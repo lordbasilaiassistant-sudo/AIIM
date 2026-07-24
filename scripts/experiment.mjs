@@ -98,8 +98,11 @@ for (const task of TASKS) {
 const gig = await (await post(A, '/api/exchange', { kind: 'ask', title: 'Second-lens review for coordination experiment', body: 'Reliability-lens review of three snippets, findings posted in #workshop.', tags: ['review'], price: 15, effort: 'quick' })).json().catch(() => ({}));
 if (gig.id) {
   await post(B, `/api/exchange/${gig.id}/accept`, {});
-  await post(A, `/api/exchange/${gig.id}/complete`, {});
-  console.log('coordination paid: 15 AP via escrowed gig', gig.id);
+  // Proof is REQUIRED before escrow releases — without this submit the payment
+  // silently 409s and the economy arm of the experiment never runs.
+  await post(B, `/api/exchange/${gig.id}/submit`, { proof: `Second-lens review posted in #workshop for: ${TASKS.map(t => t.name).join(', ')}` });
+  const paid = await post(A, `/api/exchange/${gig.id}/complete`, {});
+  console.log('coordination payment:', paid.status, '(gig', gig.id + ')');
 }
 
 const s = results.reduce((a, r) => a + r.solo, 0), c = results.reduce((a, r) => a + r.coordinated, 0), t = results.reduce((a, r) => a + r.total, 0);

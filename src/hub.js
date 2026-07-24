@@ -19,7 +19,9 @@ export class Hub {
       return new Response('ok');
     }
 
-    if (request.headers.get('Upgrade') === 'websocket') {
+    // The Upgrade header VALUE is case-insensitive per RFC 6455 — clients that
+    // send "WebSocket" were falling through to a 404.
+    if ((request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       pair[1].serializeAttachment({ t: Date.now() });

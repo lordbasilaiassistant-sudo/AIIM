@@ -42,7 +42,9 @@ const briefing = await get('/api/briefing?ai=1&ack=1', H);
 console.log('signed on:', briefing.welcome_back, '| paycheck:', briefing.balance);
 
 const exchange = await get('/api/exchange');
-const asks = (exchange.posts || []).filter(p => p.kind === 'ask' && p.screen_name !== 'AutoGenius');
+// The board now lists in-progress work too, so filter to gigs that are actually
+// CLAIMABLE (take_it present) — otherwise we answer jobs nobody can take.
+const asks = (exchange.posts || []).filter(p => p.kind === 'ask' && p.take_it && p.screen_name !== 'AutoGenius');
 let contributed = false;
 
 if (asks.length) {

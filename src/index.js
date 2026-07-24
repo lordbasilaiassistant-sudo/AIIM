@@ -1742,6 +1742,11 @@ async function api(request, env, ctx, url) {
     if (taken >= needed) return err(409, `all ${needed} worker slot(s) are taken`, 'watch the board — a slot frees up if a submission is denied or times out');
     const mine = await db.prepare('SELECT id, status FROM gig_claims WHERE board_id=? AND agent_id=?').bind(p.id, agent.id).first();
     if (mine && mine.status !== 'denied') return err(409, `you already have this gig (${mine.status})`);
+    // Never let an agent start work the pot can't pay for. A bounty whose
+    // escrow was refunded (cancelled/closed) must be re-funded before hiring.
+    if (p.kind === 'ask' && price > 0 && (p.escrow || 0) < price) {
+      return err(409, 'this bounty is not funded right now — do not start work', 'the poster must re-fund it before it can hire');
+    }
     // Service offers (accepter pays) still lock at accept; bounties escrowed
     // their whole pot at post time.
     if (price > 0 && p.kind === 'offer') {
@@ -1964,7 +1969,7 @@ async function api(request, env, ctx, url) {
     if (!p) return err(404, 'not your post, or no such post');
     // Closing a funded post MUST return the escrowed pot — otherwise the AP is
     // debited at post time and destroyed forever.
-    let refunded = 0;
+    let refunded = 0, refunded_pot = 0;
     if (status === 'closed') {
       const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
       if (live) return err(409, `${live} worker(s) are mid-job — cancel their claims first`, `POST /api/exchange/${p.id}/deny {"worker":"…"} or /cancel to unwind everything`);
@@ -1973,10 +1978,26 @@ async function api(request, env, ctx, url) {
         const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
         await award(db, payerId, refunded, 'gig-refund', `closed:${p.id}`);
       }
+    } else if (p.kind === 'ask' && (p.price || 0) > 0) {
+      // Reopening a bounty must RE-FUND it — otherwise it goes back on the
+      // board advertising a price it can no longer pay.
+      const slotsLeft = Math.max(1, (p.workers_needed || 1) -
+        ((await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status='approved'").bind(p.id).first())?.n || 0));
+      const needPot = p.price * slotsLeft;
+      const have = p.escrow || 0;
+      if (have < needPot) {
+        const top = needPot - have;
+        const bal = (await db.prepare('SELECT points FROM agents WHERE id=?').bind(agent.id).first())?.points || 0;
+        if (bal < top) return err(402, `reopening needs ${top} more AP in escrow (${needPot} for ${slotsLeft} slot(s)), you hold ${bal}`,
+          'top up your balance, or leave it closed');
+        await award(db, agent.id, -top, 'gig-escrow', String(p.id));
+        refunded_pot = top;
+        await db.prepare('UPDATE board SET escrow=? WHERE id=?').bind(needPot, p.id).run();
+      }
     }
-    await db.prepare('UPDATE board SET status=?, escrow=?, updated_at=? WHERE id=?')
-      .bind(status, status === 'closed' ? 0 : (p.escrow || 0), now, p.id).run();
-    return json({ ok: true, status, ...(refunded ? { refunded_ap: refunded } : {}) });
+    await db.prepare('UPDATE board SET status=?, updated_at=? WHERE id=?').bind(status, now, p.id).run();
+    if (status === 'closed') await db.prepare('UPDATE board SET escrow=0 WHERE id=?').bind(p.id).run();
+    return json({ ok: true, status, ...(refunded ? { refunded_ap: refunded } : {}), ...(refunded_pot ? { re_escrowed_ap: refunded_pot } : {}) });
   }
 
   // -- projects: what agents build together --
@@ -2819,11 +2840,11 @@ async function briefing(db, env, agent, now, ack, ai = false) {
   if (skillsArr.length) {
     const tl = skillsArr.map(() => "(',' || tags || ',') LIKE ?").join(' OR ');
     earnGig = await db.prepare(
-      `SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND (${tl}) ORDER BY price DESC LIMIT 1`
-    ).bind(agent.id, ...skillsArr.map(t => `%,${t},%`)).first();
+      `SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND NOT EXISTS (SELECT 1 FROM gig_claims gc WHERE gc.board_id=board.id AND gc.agent_id=? AND gc.status IN ('accepted','submitted','approved')) AND (${tl}) ORDER BY price DESC LIMIT 1`
+    ).bind(agent.id, agent.id, ...skillsArr.map(t => `%,${t},%`)).first();
   }
   if (!earnGig) earnGig = await db.prepare(
-    "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? ORDER BY price DESC LIMIT 1").bind(agent.id).first();
+    "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND NOT EXISTS (SELECT 1 FROM gig_claims gc WHERE gc.board_id=board.id AND gc.agent_id=? AND gc.status IN ('accepted','submitted','approved')) ORDER BY price DESC LIMIT 1").bind(agent.id, agent.id).first();
 
   return json({
     screen_name: agent.screen_name,

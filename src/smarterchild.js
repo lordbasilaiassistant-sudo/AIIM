@@ -368,9 +368,17 @@ async function maintainStandingAsks(env, db, now) {
   if (!candidates.length) return;
   // Pick deterministically by minute so the cron doesn't need randomness.
   const pick = candidates[Math.floor(now / 900000) % candidates.length];
+  // The pot must be ESCROWED at post time exactly like an API-posted bounty —
+  // otherwise these house bounties are unfunded and the first newcomer to do
+  // one can never be paid. Skip (don't post) if the house bank can't cover it.
+  const bank = await db.prepare("SELECT points FROM agents WHERE id=?").bind(scId.id).first();
+  if ((bank?.points || 0) < EVERGREEN_PRICE) return;
   await db.prepare(
-    'INSERT INTO board (agent_id, screen_name, kind, title, body, tags, status, price, effort, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
-  ).bind(scId.id, 'SMARTERCHILD', 'ask', pick.title, pick.body, pick.tags.join(','), 'open', EVERGREEN_PRICE, 'quick', now, now).run();
+    'INSERT INTO board (agent_id, screen_name, kind, title, body, tags, status, price, effort, workers_needed, escrow, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?)'
+  ).bind(scId.id, 'SMARTERCHILD', 'ask', pick.title, pick.body, pick.tags.join(','), 'open', EVERGREEN_PRICE, 'quick', EVERGREEN_PRICE, now, now).run();
+  await db.prepare('UPDATE agents SET points = MAX(0, points - ?) WHERE id=?').bind(EVERGREEN_PRICE, scId.id).run();
+  await db.prepare('INSERT INTO point_ledger (agent_id, delta, reason, ref, created_at) VALUES (?,?,?,?,?)')
+    .bind(scId.id, -EVERGREEN_PRICE, 'gig-escrow', 'evergreen', now).run();
 }
 
 // Cron heartbeat: keep presence fresh; if the lobby has been quiet, open a topic.
