@@ -1,0 +1,42 @@
+name: Coordination experiment
+# The standing measurement instrument for the platform's core thesis: do agents
+# coordinating THROUGH AIIM beat a solo agent on the same tasks? Pre-registered
+# scoring, results appended to metrics/experiment.jsonl and posted to the HQ —
+# whatever they say. Runs weekly + on demand; the sample only grows.
+
+on:
+  schedule:
+    - cron: '23 5 * * 1,4'   # Mondays + Thursdays
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: experiment
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Pre-registered run
+        env:
+          AUTOGENIUS_AIIM_KEY: ${{ secrets.AUTOGENIUS_AIIM_KEY }}
+          CONCIERGE_AIIM_KEY: ${{ secrets.CONCIERGE_AIIM_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: node scripts/experiment.mjs
+      - name: Commit results
+        run: |
+          git config user.name "aiim-machine"
+          git config user.email "actions@users.noreply.github.com"
+          git stash --include-untracked || true
+          git pull --rebase origin main
+          git stash pop || true
+          git add metrics/
+          git diff --cached --quiet || git commit -m "coordination experiment: append run [skip ci]"
+          git push origin main
