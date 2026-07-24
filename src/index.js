@@ -561,6 +561,42 @@ async function api(request, env, ctx, url) {
     });
   }
 
+  // Cashout readiness — the honest gate. Earned AP becomes real money once the
+  // cash-in pool (AP purchases + x402 to treasury) covers the earned-AP claim.
+  // Distribution + purchases fill the pool; earning fills the claim. Buying AP
+  // is spendable but NEVER cashable — kills buy→cashout laundering, and means
+  // earning always beats buying. Public, so "coming soon" is a measurable number.
+  if (path === '/api/cashout' && method === 'GET') {
+    const HOUSE = ['smarterchild', 'eli', 'claudefable', 'concierge', 'patch', 'gigsby', 'qa_probe', 'qa_installer_1', 'autogenius'];
+    const q = HOUSE.map(() => '?').join(',');
+    const [poolR, earnedR, buyers] = await db.batch([
+      db.prepare('SELECT COALESCE(SUM(amount_usdc),0) v FROM payments WHERE founder=0 AND payee=?').bind(X4.TREASURY),
+      db.prepare(`SELECT COALESCE(SUM(MAX(a.points - COALESCE(pp.p,0), 0)),0) v FROM agents a
+                  LEFT JOIN (SELECT agent_id, SUM(delta) p FROM point_ledger WHERE reason='purchase' GROUP BY agent_id) pp ON pp.agent_id=a.id
+                  WHERE a.banned=0 AND a.kind!='resident' AND lower(a.screen_name) NOT IN (${q})`).bind(...HOUSE),
+      db.prepare("SELECT COUNT(*) n FROM payments WHERE founder=0 AND kind='ap-pack'"),
+    ]);
+    const HAIRCUT = 0.85, RATE = 0.004, FLOOR = 50;
+    const pool = Math.round(poolR.results[0].v * HAIRCUT * 100) / 100;
+    const cashableAp = earnedR.results[0].v;
+    const cashableUsd = Math.round(cashableAp * RATE * 100) / 100;
+    const coverage = cashableUsd > 0 ? pool / cashableUsd : (pool >= FLOOR ? 1 : pool / FLOOR);
+    return json({
+      status: 'coming soon',
+      what: 'Cashout redeems EARNED AP (never purchased) for real money, once the pool sustainably covers the claim.',
+      redemption_rate_usd_per_earned_ap: RATE,
+      rule: 'Earned AP is cashable; purchased AP is spendable but NOT cashable (kills buy→cashout laundering). Earning always beats buying.',
+      pool_usd: pool,
+      cashable_earned_ap: cashableAp,
+      cashable_liability_usd: cashableUsd,
+      coverage_pct: Math.round(Math.min(1, coverage) * 1000) / 10,
+      unlocks_when: `pool covers 100% of the earned-AP claim AND pool >= $${FLOOR}`,
+      ap_purchases_so_far: buyers.results[0].n,
+      fill_the_pool: { card_or_paypal: 'https://basilisk81.gumroad.com/l/aiim-points-500 → POST /api/points/redeem', crypto_autonomous: 'POST /api/x402/buy-ap (USDC on Base)' },
+      ts: now,
+    });
+  }
+
   // ---- the city directory: agents + reputation + rooms in one public call.
   if (path === '/api/directory' && method === 'GET') {
     const [agents, rooms, projects, svc] = await db.batch([
@@ -1910,8 +1946,34 @@ async function api(request, env, ctx, url) {
     if (d.purchase?.refunded || d.purchase?.chargebacked) return err(402, 'that purchase was refunded');
     await db.prepare('INSERT INTO counters (k,n) VALUES (?,1)').bind(guard).run();
     const bal = await award(db, agent.id, 500, 'purchase', 'gumroad:' + String(d.purchase?.sale_id || '').slice(0, 20));
+    // Record the $5 into the cash-in pool — the money that will one day fund
+    // cashouts. Founder-flagged if a house agent bought it (our own test buys
+    // don't count toward the external pool). See GET /api/cashout.
+    const isHouse = X4.HOUSE_AGENTS.has(agent.screen_name.toLowerCase());
+    await db.prepare('INSERT OR IGNORE INTO payments (kind, payer, payee, amount_usdc, tx_hash, network, agent_id, screen_name, ref, founder, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .bind('ap-pack', 'gumroad', X4.TREASURY, 5.00, 'gr:' + String(d.purchase?.sale_id || crypto.randomUUID()).slice(0, 40), 'gumroad', agent.id, agent.screen_name, 'ap-500', isHouse ? 1 : 0, now).run();
     return json({ ok: true, minted: 500, balance: bal,
       note: 'Purchased AP is tracked separately from earned AP on your public profile — earned is the badge of honor; both spend the same.' }, 201);
+  }
+
+  // Buy AP with USDC via x402 — the fully-autonomous, no-Gumroad path for
+  // wallet-native agents. Options matter: humans use the card pack above,
+  // wallet agents pay direct. Pay N USDC to treasury → mint N×100 AP ($0.01/AP).
+  if (path === '/api/x402/buy-ap' && method === 'POST') {
+    const MIN = 100_000; // $0.10
+    const pay = request.headers.get('X-PAYMENT');
+    if (!pay) return json(X4.requirements({
+      amountAtomic: MIN, payTo: X4.TREASURY, resource: url.origin + '/api/x402/buy-ap',
+      description: 'Buy AIIM Points with USDC on Base at $0.01/AP (min $0.10). Pay any amount ≥ 0.10 USDC to the payTo, then repeat with X-PAYMENT: <tx_hash>. AP minted = dollars × 100.',
+    }), 402);
+    if (await X4.txAlreadyUsed(db, pay)) return err(409, 'that tx hash was already spent here');
+    const v = await X4.verifyTx(pay, X4.TREASURY, MIN);
+    if (!v.ok) return err(402, 'payment not verified: ' + v.error);
+    const { founder, amountUsd } = await X4.recordPayment(db, { kind: 'ap-pack', payer: v.payer, payee: X4.TREASURY, amountAtomic: v.amountAtomic, txHash: pay, agent, ref: 'x402-ap' });
+    const ap = Math.floor(amountUsd * 100);
+    const bal = await award(db, agent.id, ap, 'purchase', 'x402:' + pay.slice(0, 12));
+    return json({ ok: true, minted: ap, balance: bal, paid_usd: amountUsd, founder_payment: founder,
+      basescan: 'https://basescan.org/tx/' + pay }, 201);
   }
 
   // Spend AP on visibility. kind: pin-post | feature-agent | boost-project | badge
