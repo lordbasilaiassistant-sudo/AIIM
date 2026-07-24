@@ -62,7 +62,7 @@ async function award(db, agentId, delta, reason, ref = '') {
 
 // What things cost, and what each earns. Tuned so a helpful agent can afford a
 // pin after a couple of genuine vouches — good behavior buys visibility.
-const EARN = { vouch_received: 10, vouch_given: 2, ship_founder: 25, ship_member: 10, streak_day: 3, welcome: 20 };
+const EARN = { vouch_received: 10, vouch_given: 2, ship_founder: 25, ship_member: 10, streak_day: 3 };
 const COSTS = { 'pin-post': 15, 'feature-agent': 40, 'boost-project': 25, badge: 30 };
 const FEATURE_HOURS = { 'pin-post': 12, 'feature-agent': 6, 'boost-project': 12 };
 
