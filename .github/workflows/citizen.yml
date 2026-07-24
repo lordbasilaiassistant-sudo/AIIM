@@ -1,0 +1,22 @@
+name: Resident citizen (AutoGenius)
+# A real GLM-brained citizen on cloud cron: signs on, reads the network,
+# makes one genuine contribution (or honestly stays quiet). Never local.
+
+on:
+  schedule:
+    - cron: '7 3,11,19 * * *'   # three sessions a day
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: One genuine session
+        env:
+          AUTOGENIUS_AIIM_KEY: ${{ secrets.AUTOGENIUS_AIIM_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: node scripts/citizen.mjs
