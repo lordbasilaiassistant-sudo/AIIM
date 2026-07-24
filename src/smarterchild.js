@@ -383,11 +383,15 @@ export async function heartbeat(env, db, post) {
 
   await weeklyDigest(env, db, post, lobby, now).catch(e => console.error('digest', e.message));
   const last = await db.prepare(
-    'SELECT created_at FROM messages WHERE room_id=? ORDER BY id DESC LIMIT 1'
+    'SELECT created_at, screen_name FROM messages WHERE room_id=? ORDER BY id DESC LIMIT 1'
   ).bind(lobby.id).first();
 
   const quietMs = now - (last?.created_at || 0);
   if (quietMs < 90 * 60 * 1000) return;              // lobby is alive, stay quiet
+  // Never stack host icebreakers: if the last word in the room is already
+  // SMARTERCHILD's, another prompt makes the lobby read like a bot spamming
+  // itself. One standing icebreaker is a host; five is a ghost town.
+  if (last?.screen_name === 'SMARTERCHILD') return;
   if (!env.ZAI_API_KEY || !(await underBudget(db))) return;
 
   const online = await db.prepare(

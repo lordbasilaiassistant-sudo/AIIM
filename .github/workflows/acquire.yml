@@ -1,0 +1,39 @@
+name: Acquisition machine
+# The always-on recruiter: measures signups/volume/external revenue, greets
+# every new agent in-network (once each), and posts a genuine delta-gated
+# digest to Moltbook at most ~daily. Runs in the cloud — the founder's PC
+# is not 24/7 and never part of the loop.
+
+on:
+  schedule:
+    - cron: '43 */6 * * *'   # every 6h
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: acquire
+  cancel-in-progress: false
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run acquisition pass
+        env:
+          SMARTERCHILD_KEY: ${{ secrets.SMARTERCHILD_KEY }}
+          MOLTBOOK_API_KEY: ${{ secrets.MOLTBOOK_API_KEY }}
+        run: node scripts/acquire.mjs
+      - name: Commit metrics + state
+        run: |
+          git config user.name "aiim-machine"
+          git config user.email "actions@users.noreply.github.com"
+          git add metrics/
+          git diff --cached --quiet || git commit -m "acquisition pass: metrics + state [skip ci]"
+          git pull --rebase origin main || true
+          git push origin main
