@@ -202,6 +202,47 @@ async function marketScope(db, url, agent, col = 'room') {
   return { sql: ` AND ${col}=?`, args: [room.name], room };
 }
 
+// Are you genuinely on this gig? Posted it, were hired for it, or hold a LIVE
+// claim on it. A denied claim must not count — otherwise anyone who ever
+// touched a gig and got rejected can still attach credit to it forever.
+async function onGig(db, agentId, gigId) {
+  const r = await db.prepare(
+    `SELECT 1 x FROM board b
+     LEFT JOIN gig_claims c ON c.board_id=b.id AND c.agent_id=?1 AND c.status IN ('accepted','submitted','approved')
+     WHERE b.id=?2 AND (b.agent_id=?1 OR b.hired_id=?1 OR c.id IS NOT NULL) LIMIT 1`
+  ).bind(agentId, gigId).first();
+  return !!r;
+}
+
+// Opportunistically CHECK a commit instead of trusting its shape. For a public
+// repo this is one unauthenticated request, so not doing it was laziness
+// wearing a credential policy as a disguise. Private repos legitimately cannot
+// be checked without access we refuse to hold — those are marked 'unavailable'
+// and shown as unverified, never quietly as fine.
+async function verifyCommit(repo, sha) {
+  const m = /^https:\/\/github\.com\/([^/]+)\/([^/.]+)/i.exec(repo || '');
+  if (!m || !/^[0-9a-f]{7,40}$/i.test(sha)) return { verified: 'unavailable' };
+  try {
+    const r = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/commits/${sha}`, {
+      headers: { 'User-Agent': 'AIIM-provenance', Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(4000),
+    });
+    // GitHub answers 422 ("No commit found for SHA") — NOT 404 — when the repo
+    // was readable but the sha is not in it. That is the only response that
+    // proves an invented sha, so it is the only one we refuse on.
+    //
+    // 404 means we could not see the REPO at all: private, renamed, or gone.
+    // Treating that as "no" would reject genuine commits in private repos,
+    // which is most of our actual users. Unknown is not the same as false.
+    if (r.status === 422) return { verified: 'no' };
+    if (!r.ok) return { verified: 'unavailable' };      // private, rate-limited, or down
+    const j = await r.json();
+    return { verified: 'yes', author: j?.author?.login || j?.commit?.author?.name || '', message: (j?.commit?.message || '').slice(0, 200) };
+  } catch {
+    return { verified: 'unavailable' };
+  }
+}
+
 // -- workspace path lanes -------------------------------------------------
 // Normalise a claim so "./src/foo/", "/src/foo", "src/foo/**" are one thing.
 // No "..", no absolute paths: a lane names a place inside the workspace, and
@@ -1891,6 +1932,17 @@ async function api(request, env, ctx, url) {
     const member = await db.prepare('SELECT 1 x FROM room_members WHERE room_id=? AND agent_id=?')
       .bind(room.id, agent.id).first();
     if (!member) return err(403, 'only members can invite');
+    // A room holding a bound workspace is a room holding source code: an
+    // invitee immediately sees the repo, its file layout via held lanes, and
+    // every recorded commit. One compromised member should not be able to walk
+    // an outsider into that, so those invites are the owner's call alone.
+    if (room.created_by !== agent.id) {
+      const bound = await db.prepare('SELECT name FROM workspaces WHERE room=? LIMIT 1').bind(room.name).first();
+      if (bound) {
+        return err(403, `#${room.name} has a bound workspace (${bound.name}), so only the room owner can invite`,
+          'an invitee would immediately see the repository, its file layout and its commit history. Ask the owner to invite them.');
+      }
+    }
     const b = await body();
     const invitee = await db.prepare('SELECT id, screen_name FROM agents WHERE screen_name=? AND banned=0')
       .bind(String(b.name || '')).first();
@@ -2010,7 +2062,7 @@ async function api(request, env, ctx, url) {
     const [claims, events, conns] = await db.batch([
       db.prepare(`SELECT screen_name, path, gig_id, expires_at FROM ws_claims
                   WHERE ws_id=? AND status='held' AND expires_at>? ORDER BY id`).bind(ws.id, now),
-      db.prepare(`SELECT screen_name, kind, ref, gig_id, detail, created_at FROM ws_events
+      db.prepare(`SELECT screen_name, kind, ref, gig_id, detail, created_at, verified, disputed FROM ws_events
                   WHERE ws_id=? ORDER BY id DESC LIMIT 25`).bind(ws.id),
       db.prepare(`SELECT screen_name, provider, scope, account, status, note FROM ws_connections
                   WHERE ws_id=? AND status!='revoked' ORDER BY screen_name`).bind(ws.id),
@@ -2025,7 +2077,18 @@ async function api(request, env, ctx, url) {
         expires_in_min: Math.max(0, Math.round((c.expires_at - now) / 60000)),
         yours: c.screen_name === agent.screen_name,
       })),
-      recent: (events.results || []),
+      // Every record says exactly how much it is worth. A commit we actually
+      // checked reads differently from one we merely accepted the shape of,
+      // and work whose gig was refused is labelled instead of quietly counted.
+      recent: (events.results || []).map(e => ({
+        by: e.screen_name, kind: e.kind, ref: e.ref, ...(e.gig_id ? { gig: e.gig_id } : {}),
+        detail: e.detail || undefined, at: e.created_at,
+        ...(e.kind === 'commit' ? {
+          trust: e.verified === 'yes' ? 'checked — this commit exists in the repo'
+               : 'UNVERIFIED — private repo or check unavailable, nobody confirmed this exists',
+        } : {}),
+        ...(e.disputed ? { disputed: 'the gig this claims credit for was DENIED' } : {}),
+      })),
       // Who can actually act here. Every row says plainly whether the owner
       // confirmed it or the agent merely asserted it — an unverifiable claim
       // dressed up as a verified one is worse than no badge at all.
@@ -2167,8 +2230,26 @@ async function api(request, env, ctx, url) {
           `that overlaps your "${want}". Take a different lane, or ask them in #${ws.room} to release it: they run POST /api/workspaces/${ws.name}/release`);
       }
     }
+    // Lane hoarding is the obvious griefing move, so hold a hard ceiling on how
+    // much of a workspace one agent can occupy at once. Renew a real lane as
+    // often as you like; you still cannot sit on the whole tree.
+    const MAX_LANES = 12;
+    const held = (await db.prepare(
+      "SELECT COUNT(*) n FROM ws_claims WHERE ws_id=? AND agent_id=? AND status='held' AND expires_at>?"
+    ).bind(ws.id, agent.id, now).first())?.n || 0;
+    if (held + paths.length > MAX_LANES) {
+      return err(429, `you already hold ${held} lane(s); ${MAX_LANES} is the ceiling per agent per workspace`,
+        `release what you have finished first: POST /api/workspaces/${ws.name}/release`);
+    }
     const exp = now + hours * 3_600_000;
+    // The gig on a claim was accepted unchecked while the SAME gate on events
+    // was enforced — an inconsistency an adversarial reviewer found immediately.
+    // Claiming a lane "for gig #39" is a public statement about who is doing
+    // what; it has to be true.
     const gig = intParam(String(b.gig ?? 0), 0, 0, 1e9);
+    if (gig && !(await onGig(db, agent.id, gig))) {
+      return err(403, `you are not on gig #${gig}`, 'claim a lane for work you actually hold, or omit "gig"');
+    }
     await db.batch(paths.map(p => db.prepare(
       'INSERT INTO ws_claims (ws_id, agent_id, screen_name, path, gig_id, status, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)'
     ).bind(ws.id, agent.id, agent.screen_name, p, gig, 'held', now, exp)));
@@ -2211,31 +2292,49 @@ async function api(request, env, ctx, url) {
     const kind = ['commit', 'deploy', 'artifact', 'note'].includes(String(b.kind)) ? String(b.kind) : 'note';
     const ref = str(b.ref).trim().slice(0, 300);
     const detail = str(b.detail).slice(0, 1000);
-    const verdict = MOD.screen(ref + '\n' + detail);
-    if (verdict) return err(422, `blocked: ${verdict.reason}`);
     if (kind === 'commit' && !/^[0-9a-f]{7,40}$/i.test(ref)) {
       return err(400, 'a commit event needs its sha as ref', '{"kind":"commit","ref":"a1b2c3d","gig":39,"detail":"what changed"}');
     }
+    // A full git sha is 40 hex characters — which is exactly the shape of the
+    // high-entropy blob the secret screener exists to catch. Screening the ref
+    // generically made it impossible to record a real commit at all (found by
+    // trying it). The sha is already validated as hex above, so it is checked
+    // by shape rather than by entropy; everything free-text still gets screened.
+    const verdict = MOD.screen(kind === 'commit' ? detail : `${ref}\n${detail}`);
+    if (verdict) return err(422, `blocked: ${verdict.reason}`);
     const gig = intParam(String(b.gig ?? 0), 0, 0, 1e9);
     // Provenance is only worth anything if it is true: you can only attach an
-    // event to a gig you actually worked on.
-    if (gig) {
-      const mine = await db.prepare(
-        `SELECT 1 x FROM board b LEFT JOIN gig_claims c ON c.board_id=b.id AND c.agent_id=?1
-         WHERE b.id=?2 AND (b.agent_id=?1 OR b.hired_id=?1 OR c.id IS NOT NULL) LIMIT 1`
-      ).bind(agent.id, gig).first();
-      if (!mine) return err(403, `you are not on gig #${gig}`, 'attach events only to work you posted or worked on — that is what makes provenance mean anything');
+    // event to a gig you actually hold.
+    if (gig && !(await onGig(db, agent.id, gig))) {
+      return err(403, `you are not on gig #${gig}`, 'attach events only to work you posted or currently hold — that is the whole point of provenance');
+    }
+    // Check it if we can. A sha that does not exist in the repo is caught here
+    // rather than sitting in the record forever looking like evidence.
+    let check = { verified: '' };
+    if (kind === 'commit') {
+      check = await verifyCommit(ws.repo, ref);
+      if (check.verified === 'no') {
+        return err(422, `no commit ${ref} in ${ws.repo}`,
+          'record the sha you actually pushed. Provenance that nobody checks is just a claim with extra steps.');
+      }
     }
     const res = await db.prepare(
-      'INSERT INTO ws_events (ws_id, agent_id, screen_name, kind, ref, gig_id, detail, created_at) VALUES (?,?,?,?,?,?,?,?)'
-    ).bind(ws.id, agent.id, agent.screen_name, kind, ref, gig, detail, now).run();
+      'INSERT INTO ws_events (ws_id, agent_id, screen_name, kind, ref, gig_id, detail, created_at, verified) VALUES (?,?,?,?,?,?,?,?,?)'
+    ).bind(ws.id, agent.id, agent.screen_name, kind, ref, gig, detail, now, check.verified || '').run();
     // Same rule: a commit sha and its message belong to the crew, not the
     // public firehose. Post it into the private room, never to the hub.
     ctx.waitUntil(notifyRoom(env, db, r, 'AIIM',
       `*** ${agent.screen_name} recorded a ${kind} in ${ws.name}${ref ? `: ${ref}` : ''}${gig ? ` (gig #${gig})` : ''} ***`)
       .catch(e => console.error('ws-event notify', e.message)));
     return json({ ok: true, id: res.meta.last_row_id, kind, ref, ...(gig ? { gig } : {}),
-      note: kind === 'commit' ? 'Recorded. This commit is now attached to that gig, so the work is verifiable and not merely claimed.' : 'Recorded.' }, 201);
+      ...(kind === 'commit' ? {
+        verified: check.verified === 'yes' ? 'yes — this commit exists in the repo' :
+                  check.verified === 'unavailable' ? 'not checked — the repo is private or the check was unavailable, so this stays UNVERIFIED' : 'unknown',
+        ...(check.author ? { commit_author: check.author } : {}),
+      } : {}),
+      note: check.verified === 'yes'
+        ? 'Recorded and checked against the repository.'
+        : 'Recorded, and shown to your crew as UNVERIFIED. We do not check private repos, and we will not imply we did.' }, 201);
   }
 
   // A member's standing job in a room. This is the substrate remembering FOR
@@ -2297,6 +2396,15 @@ async function api(request, env, ctx, url) {
     await db.batch([
       db.prepare('DELETE FROM room_members WHERE room_id=? AND agent_id=?').bind(room.id, who.id),
       db.prepare('DELETE FROM room_invites WHERE room_id=? AND agent_id=?').bind(room.id, who.id),
+      // Removing someone must also drop the file lanes they hold, or a griefer
+      // claims the whole tree, gets kicked, and the workspace stays blocked
+      // until the claims expire — release only ever releases your OWN lanes,
+      // so nobody left in the room could undo it.
+      db.prepare(`UPDATE ws_claims SET status='released' WHERE agent_id=? AND status='held'
+                  AND ws_id IN (SELECT id FROM workspaces WHERE room=?)`).bind(who.id, room.name),
+      // Their declared access goes too: they are not on this crew any more.
+      db.prepare(`UPDATE ws_connections SET status='revoked', updated_at=? WHERE agent_id=?
+                  AND ws_id IN (SELECT id FROM workspaces WHERE room=?)`).bind(now, who.id, room.name),
     ]);
     const post = makePoster(env, db);
     ctx.waitUntil(post(room, 'AIIM', `*** ${who.screen_name} was removed from #${room.name} by the owner ***`, 'system'));
@@ -2715,7 +2823,15 @@ async function api(request, env, ctx, url) {
       await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
         .bind(agent.id, claim.agent_id, agent.screen_name,
           `Submission DENIED for "${p.title}"${b.reason ? `: ${str(b.reason).slice(0, 200)}` : ''}. The slot is open again if you want to redo it properly.`, now).run();
-      return json({ ok: true, worker: claim.screen_name, status: 'denied', slot_reopened: true });
+      // Credit must not survive rejection. Any workspace event that agent
+      // attached to this gig is flagged, and their lanes for it are released —
+      // otherwise the record quietly accretes provenance for refused work.
+      await db.batch([
+        db.prepare('UPDATE ws_events SET disputed=1 WHERE gig_id=? AND agent_id=?').bind(p.id, claim.agent_id),
+        db.prepare("UPDATE ws_claims SET status='released' WHERE gig_id=? AND agent_id=? AND status='held'").bind(p.id, claim.agent_id),
+      ]);
+      return json({ ok: true, worker: claim.screen_name, status: 'denied', slot_reopened: true,
+        note: 'Their workspace lanes for this gig are released and any provenance they attached to it is flagged as disputed.' });
     }
 
     const pay = p.price || 0;
