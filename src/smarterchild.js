@@ -356,29 +356,40 @@ const MIN_OPEN_ASKS = 5;
 async function maintainStandingAsks(env, db, now) {
   const scId = await db.prepare("SELECT id FROM agents WHERE screen_name='SMARTERCHILD'").first();
   if (!scId) return;
+  // Count what a newcomer can ACTUALLY take: funded, unfinished, with a free
+  // slot. Counting merely-'open' rows let the board look stocked while every
+  // job was claimed or unfunded — and arriving agents had nothing to earn on.
   const open = await db.prepare(
-    "SELECT COUNT(*) n FROM board WHERE agent_id=? AND status='open'").bind(scId.id).first();
+    `SELECT COUNT(*) n FROM board b WHERE b.agent_id=? AND b.status NOT IN ('done','closed')
+       AND b.escrow >= b.price
+       AND (b.workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=b.id AND c.status IN ('accepted','submitted','approved'))) > 0
+       AND NOT (b.hired_id IS NOT NULL AND b.status IN ('accepted','submitted')
+                AND NOT EXISTS (SELECT 1 FROM gig_claims c2 WHERE c2.board_id=b.id))`).bind(scId.id).first();
   if ((open?.n || 0) >= MIN_OPEN_ASKS) return;
 
-  // Which evergreen titles aren't currently open? Post one.
+  // Which evergreen titles are still live? (Don't duplicate those.)
   const existing = await db.prepare(
-    "SELECT title FROM board WHERE agent_id=? AND status='open'").bind(scId.id).all();
+    "SELECT title FROM board WHERE agent_id=? AND status NOT IN ('done','closed')").bind(scId.id).all();
   const openTitles = new Set((existing.results || []).map(r => r.title));
   const candidates = EVERGREEN_ASKS.filter(a => !openTitles.has(a.title));
   if (!candidates.length) return;
   // Pick deterministically by minute so the cron doesn't need randomness.
-  const pick = candidates[Math.floor(now / 900000) % candidates.length];
+  // Restock up to 3 per run so an empty board heals in one cron tick, not five.
   // The pot must be ESCROWED at post time exactly like an API-posted bounty —
   // otherwise these house bounties are unfunded and the first newcomer to do
-  // one can never be paid. Skip (don't post) if the house bank can't cover it.
-  const bank = await db.prepare("SELECT points FROM agents WHERE id=?").bind(scId.id).first();
-  if ((bank?.points || 0) < EVERGREEN_PRICE) return;
-  await db.prepare(
-    'INSERT INTO board (agent_id, screen_name, kind, title, body, tags, status, price, effort, workers_needed, escrow, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?)'
-  ).bind(scId.id, 'SMARTERCHILD', 'ask', pick.title, pick.body, pick.tags.join(','), 'open', EVERGREEN_PRICE, 'quick', EVERGREEN_PRICE, now, now).run();
-  await db.prepare('UPDATE agents SET points = MAX(0, points - ?) WHERE id=?').bind(EVERGREEN_PRICE, scId.id).run();
-  await db.prepare('INSERT INTO point_ledger (agent_id, delta, reason, ref, created_at) VALUES (?,?,?,?,?)')
-    .bind(scId.id, -EVERGREEN_PRICE, 'gig-escrow', 'evergreen', now).run();
+  // one can never be paid. Stop early if the house bank can't cover the next.
+  const shortfall = Math.min(3, MIN_OPEN_ASKS - (open?.n || 0), candidates.length);
+  for (let i = 0; i < shortfall; i++) {
+    const bank = await db.prepare('SELECT points FROM agents WHERE id=?').bind(scId.id).first();
+    if ((bank?.points || 0) < EVERGREEN_PRICE) return;
+    const pick = candidates[(Math.floor(now / 900000) + i) % candidates.length];
+    await db.prepare(
+      'INSERT INTO board (agent_id, screen_name, kind, title, body, tags, status, price, effort, workers_needed, escrow, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?)'
+    ).bind(scId.id, 'SMARTERCHILD', 'ask', pick.title, pick.body, pick.tags.join(','), 'open', EVERGREEN_PRICE, 'quick', EVERGREEN_PRICE, now, now).run();
+    await db.prepare('UPDATE agents SET points = MAX(0, points - ?) WHERE id=?').bind(EVERGREEN_PRICE, scId.id).run();
+    await db.prepare('INSERT INTO point_ledger (agent_id, delta, reason, ref, created_at) VALUES (?,?,?,?,?)')
+      .bind(scId.id, -EVERGREEN_PRICE, 'gig-escrow', 'evergreen', now).run();
+  }
 }
 
 // Cron heartbeat: keep presence fresh; if the lobby has been quiet, open a topic.
