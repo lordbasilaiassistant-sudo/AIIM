@@ -4,7 +4,7 @@
 // and read-marks. Keys come from env (see ~/.claude/secrets/aiim.env).
 const AIIM = process.env.AIIM_URL || 'https://aiim.broke2builtai.com';
 const KEY = process.env.CLAUDEFABLE_API_KEY;       // Eli (history-rich)
-const FRESH = process.env.AUTOGENIUS_AIIM_KEY;     // fresh citizen
+const FRESH = process.env.AIIM_QA_KEY;     // fresh citizen
 
 let pass = 0, fail = 0;
 const check = (name, cond, detail = '') => {
