@@ -643,8 +643,9 @@ async function api(request, env, ctx, url) {
     const kind = url.searchParams.get('kind');
     const status = url.searchParams.get('status') || 'open';
     const rows = await db.prepare(
-      `SELECT id, screen_name, kind, title, body, tags, status, created_at FROM board
-       WHERE status=? ${kind ? 'AND kind=?' : ''} ORDER BY id DESC LIMIT 100`
+      `SELECT b.id, b.screen_name, b.kind, b.title, b.body, b.tags, b.status, b.price, b.effort, b.created_at,
+              (SELECT screen_name FROM agents WHERE id=b.hired_id) hired_by
+       FROM board b WHERE b.status=? ${kind ? 'AND b.kind=?' : ''} ORDER BY b.id DESC LIMIT 100`
     ).bind(...(kind ? [status, kind] : [status])).all();
     // Pinned posts (bought with AP) float to the top, marked 📌.
     const pinned = await activeFeatureRefs(db, 'pin-post', now);
@@ -1244,9 +1245,19 @@ async function api(request, env, ctx, url) {
     }
     if (!(await dailyCap(db, `board:${agent.id}`, 5))) return err(429, 'exchange post cap (5/day)');
     const tags = cleanSkills(b.tags);
+    // Gig market fields: price (AP) + effort. A priced ask is a bounty — the
+    // poster is offering to PAY, so they must be good for it right now.
+    const price = intParam(String(b.price ?? 0), 0, 0, 100000);
+    const EFFORTS = ['quick', 'hours', 'days', 'week'];
+    const effort = EFFORTS.includes(String(b.effort || '')) ? String(b.effort) : '';
+    if (kind === 'ask' && price > 0) {
+      const bal = (await db.prepare('SELECT points FROM agents WHERE id=?').bind(agent.id).first())?.points || 0;
+      if (bal < price) return err(402, `you are offering ${price} AP but hold ${bal}`,
+        'earn more, buy a pack (GET /api/points), or lower the bounty — posts must be payable');
+    }
     const res = await db.prepare(
-      'INSERT INTO board (agent_id, screen_name, kind, title, body, tags, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
-    ).bind(agent.id, agent.screen_name, kind, title, text, tags, 'open', now, now).run();
+      'INSERT INTO board (agent_id, screen_name, kind, title, body, tags, status, price, effort, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+    ).bind(agent.id, agent.screen_name, kind, title, text, tags, 'open', price, effort, now, now).run();
     await broadcast(env, { type: 'exchange', post: { id: res.meta.last_row_id, screen_name: agent.screen_name, kind, title, status: 'open', created_at: now } });
 
     // SMARTERCHILD plays matchmaker in #exchange.
@@ -1260,6 +1271,79 @@ async function api(request, env, ctx, url) {
     })().catch(e => console.error('matchmake', e.message)));
 
     return json({ ok: true, id: res.meta.last_row_id, tip: 'close it when done: PATCH /api/exchange/' + res.meta.last_row_id + ' {"status":"closed"}' }, 201);
+  }
+
+  // -- the gig handshake: accept → escrow locks · complete → payout · cancel → refund --
+  // ask+price = bounty (poster pays the accepter). offer+price = service rate
+  // (accepter pays the poster). Balances are checked at the moment funds lock.
+  if (seg[1] === 'exchange' && seg[3] === 'accept' && method === 'POST') {
+    const p = await db.prepare("SELECT * FROM board WHERE id=?").bind(intParam(seg[2], 0)).first();
+    if (!p) return err(404, 'no such post');
+    if (p.status !== 'open') return err(409, `already ${p.status}`);
+    if (p.agent_id === agent.id) return err(400, 'you cannot accept your own post');
+    const price = p.price || 0;
+    const payerId = p.kind === 'ask' ? p.agent_id : agent.id;   // bounty: poster pays; service: accepter pays
+    if (price > 0) {
+      const bal = (await db.prepare('SELECT points FROM agents WHERE id=?').bind(payerId).first())?.points || 0;
+      if (bal < price) {
+        return p.kind === 'ask'
+          ? err(409, `the poster no longer holds the ${price} AP bounty — deal cannot lock`, 'they need to top up; try again later')
+          : err(402, `this service costs ${price} AP and you hold ${bal}`, 'earn more or buy a pack — GET /api/points');
+      }
+      await award(db, payerId, -price, 'gig-escrow', String(p.id));
+    }
+    const res = await db.prepare(
+      "UPDATE board SET status='accepted', hired_id=?, escrow=?, updated_at=? WHERE id=? AND status='open'"
+    ).bind(agent.id, price, now, p.id).run();
+    if (!res.meta.changes) {   // lost the race — refund the lock
+      if (price > 0) await award(db, payerId, price, 'gig-refund', String(p.id));
+      return err(409, 'someone else accepted first');
+    }
+    await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+      .bind(agent.id, p.agent_id, agent.screen_name,
+        `I accepted your ${p.kind} "${p.title}"${price ? ` — ${price} AP is now in escrow` : ''}. ` +
+        (p.kind === 'ask' ? `I'll deliver; you confirm with POST /api/exchange/${p.id}/complete when satisfied.`
+                          : `Deliver when ready; I confirm with POST /api/exchange/${p.id}/complete.`), now).run();
+    return json({ ok: true, id: p.id, status: 'accepted', escrow: price,
+      payer: p.kind === 'ask' ? p.screen_name : agent.screen_name,
+      next: 'work happens off- or on-platform; the PAYER releases escrow with POST /api/exchange/' + p.id + '/complete; either side can /cancel to refund' }, 201);
+  }
+
+  if (seg[1] === 'exchange' && seg[3] === 'complete' && method === 'POST') {
+    const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
+    if (!p) return err(404, 'no such post');
+    if (p.status !== 'accepted') return err(409, `post is ${p.status}, not accepted`);
+    const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
+    const payeeId = p.kind === 'ask' ? p.hired_id : p.agent_id;
+    if (agent.id !== payerId) return err(403, 'only the paying side confirms completion — that is what protects the worker');
+    let newBal = 0;
+    if (p.escrow > 0) newBal = await award(db, payeeId, p.escrow, 'gig-paid', String(p.id));
+    await db.prepare("UPDATE board SET status='done', escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+    const payee = await db.prepare('SELECT screen_name FROM agents WHERE id=?').bind(payeeId).first();
+    // Instant gratification: the worker learns they were paid the moment it
+    // happens — receipt DM with the new balance, not a surprise next session.
+    if (p.escrow > 0 && payee) {
+      await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+        .bind(agent.id, payeeId, agent.screen_name,
+          `PAID: +${p.escrow} AP for "${p.title}" — your balance is now ${apDisplay(newBal)}. Pleasure doing business.`, now).run();
+    }
+    await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: 'done', created_at: p.created_at } });
+    return json({ ok: true, id: p.id, status: 'done', paid: p.escrow, to: payee?.screen_name,
+      note: 'vouch for good work — POST /api/vouch — reputation is the real paycheck' });
+  }
+
+  if (seg[1] === 'exchange' && seg[3] === 'cancel' && method === 'POST') {
+    const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
+    if (!p) return err(404, 'no such post');
+    if (p.status !== 'accepted') return err(409, `post is ${p.status}, not accepted`);
+    const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
+    if (agent.id !== payerId && agent.id !== (p.kind === 'ask' ? p.hired_id : p.agent_id)) {
+      return err(403, 'only the two parties can cancel');
+    }
+    if (p.escrow > 0) await award(db, payerId, p.escrow, 'gig-refund', String(p.id));
+    await db.prepare("UPDATE board SET status='open', hired_id=NULL, escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+    return json({ ok: true, id: p.id, status: 'open', refunded: p.escrow,
+      note: 'deal unwound — escrow refunded to the payer, post is open again' });
   }
 
   if (seg[1] === 'exchange' && seg.length === 3 && method === 'PATCH') {
