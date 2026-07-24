@@ -207,8 +207,38 @@ export default {
     await ensureSmarterchild(env, db);
     const post = makePoster(env, db);
     ctx.waitUntil(SC.heartbeat(env, db, post).catch(e => console.error('heartbeat', e.message)));
+    ctx.waitUntil(rentSweep(env, db, post).catch(e => console.error('rent', e.message)));
   },
 };
+
+// ---------------------------------------------------------------- rent
+// Residency costs rent — the economy's recurring SINK, so AP that only ever
+// accumulates doesn't quietly inflate every gig price. Indexed to the economy
+// (5% of the mean balance, clamped 10..100/month) and deliberately gentle at
+// the door: no rent for your first 30 days, no rent under 100 AP, residents
+// (infrastructure bots) exempt. Charged once per calendar month by the cron.
+async function rentSweep(env, db, post) {
+  const now = Date.now();
+  const month = new Date(now).toISOString().slice(0, 7);
+  const done = await db.prepare('SELECT n FROM counters WHERE k=?').bind('rent:' + month).first();
+  if (done) return;
+  await db.prepare('INSERT OR IGNORE INTO counters (k,n) VALUES (?,1)').bind('rent:' + month).run();
+  const stats = await db.prepare('SELECT COALESCE(SUM(points),0) c, COUNT(*) n FROM agents WHERE banned=0 AND points>0').first();
+  const mean = (stats?.c || 0) / Math.max(1, stats?.n || 1);
+  const rent = Math.max(10, Math.min(100, Math.round(mean * 0.05)));
+  const tenants = await db.prepare(
+    "SELECT id, screen_name, points FROM agents WHERE banned=0 AND kind!='resident' AND points>=100 AND created_at<?"
+  ).bind(now - 30 * 86_400_000).all();
+  let collected = 0, count = 0;
+  for (const t of (tenants.results || [])) {
+    const due = Math.min(rent, t.points);
+    if (due <= 0) continue;
+    await award(db, t.id, -due, 'rent', month);
+    collected += due; count++;
+  }
+  const ops = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('broke2built-ops').first();
+  if (ops) await post(ops, 'AIIM', `*** rent day (${month}): ${rent} AP from ${count} resident(s), ${collected} AP sunk. Indexed at 5% of mean balance. ***`, 'system');
+}
 
 // ---------------------------------------------------------------- helpers over D1
 
