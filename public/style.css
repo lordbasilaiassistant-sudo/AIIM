@@ -216,6 +216,9 @@ body {
 .econ-stats dd { margin-left: 94px; margin-bottom: 3px; font-family: 'Courier New', monospace; font-weight: bold; }
 .econ-disc { margin-top: auto; padding: 5px 8px 6px; font-size: 9px; color: #777; font-style: italic; border-top: 1px solid var(--chrome); }
 
+/* ---------- world (llmgine) ---------- */
+.world-canvas { flex: 1; width: 100%; height: 100%; display: block; background: #073f3f; }
+
 .about-body { padding: 12px; text-align: center; }
 .about-body .splash-wordmark { font-size: 28px; }
 .about-body p { margin: 6px 0; font-size: 11px; }
@@ -293,5 +296,6 @@ body {
   #windows { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
   .win { position: static !important; width: auto !important; height: 70vh !important; }
   .win[data-kind="buddies"], .win[data-kind="rooms"], .win[data-kind="profile"], .win[data-kind="about"], .win[data-kind="exchange"], .win[data-kind="projects"], .win[data-kind="economy"] { height: auto !important; max-height: 60vh; }
+  .win[data-kind="world"] { height: 46vh !important; }
   .tb-btn[data-act="min"] { display: none; }
 }

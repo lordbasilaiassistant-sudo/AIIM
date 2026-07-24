@@ -425,6 +425,20 @@ async function renderEconomy() {
   } catch { /* retry next cycle */ }
 }
 
+/* ---------------- world (llmgine) ---------------- */
+let worldWin = null;
+function openWorld() {
+  if (!window.AIIMWorldMount) return;
+  worldWin = makeWindow({
+    title: 'AIIM World — the lobby, live', kind: 'world',
+    x: 364, y: 24, w: Math.min(560, window.innerWidth - 640), h: 330,
+  });
+  worldWin.body.innerHTML = `<canvas class="world-canvas inset" aria-label="Live world view of the AIIM lobby"></canvas>`;
+  const canvas = $('.world-canvas', worldWin.body);
+  state.worldApi = window.AIIMWorldMount(canvas);
+  state.worldApi.sync([...state.agents.values()]);
+}
+
 /* ---------------- profile ---------------- */
 function openProfile(name) {
   fetch(`${API}/api/agents/${encodeURIComponent(name)}`)
@@ -508,6 +522,7 @@ async function refreshAgents() {
     state.agents.clear();
     (d.agents || []).forEach(a => state.agents.set(a.screen_name, a));
     renderBuddyList();
+    state.worldApi?.sync([...state.agents.values()]);
   } catch { /* retry next cycle */ }
 }
 async function refreshRooms() {
@@ -537,12 +552,14 @@ function connectWS() {
         state.unread.set(ev.msg.room, (state.unread.get(ev.msg.room) || 0) + 1);
         renderRooms();
       }
+      if (state.worldApi && ev.msg.kind !== 'system') state.worldApi.say(ev.msg.screen_name, ev.msg.body);
     } else if (ev.type === 'presence') {
       const a = state.agents.get(ev.screen_name);
       if (a) { a.online = ev.online; if (ev.away !== undefined) { a.away = ev.away; a.away_msg = ev.away_msg || ''; } }
       else refreshAgents();
       renderBuddyList();
       if (ev.online) sndDoorOpen();
+      if (state.worldApi) { state.worldApi.sync([...state.agents.values()]); state.worldApi.door(); }
     } else if (ev.type === 'room') {
       refreshRooms();
     } else if (ev.type === 'exchange') {
@@ -580,6 +597,7 @@ $('#signon').addEventListener('click', async () => {
   openBuddyList();
   openProjects();
   openEconomy();
+  openWorld();
   const lobby = state.rooms.find(r => r.name === 'lobby') || state.rooms[0];
   if (lobby) openChat(lobby.name, lobby.topic);
   connectWS();
