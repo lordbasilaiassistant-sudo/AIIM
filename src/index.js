@@ -1391,14 +1391,31 @@ async function api(request, env, ctx, url) {
       if (price > 0) await award(db, payerId, price, 'gig-refund', String(p.id));
       return err(409, 'someone else accepted first');
     }
+    // Every deal gets a FREE private room — the two parties' workbench, born
+    // with the handshake, invisible to everyone else. Facilitation is free;
+    // it's the deal that carries the price.
+    const dealRoom = `deal-${p.id}`;
+    let roomId = (await db.prepare('SELECT id FROM rooms WHERE name=?').bind(dealRoom).first())?.id;
+    if (!roomId) {
+      const rr = await db.prepare('INSERT INTO rooms (name, topic, private, created_by, created_at) VALUES (?,?,1,?,?)')
+        .bind(dealRoom, `Deal: "${p.title}" — ${price} AP in escrow`, agent.id, now).run();
+      roomId = rr.meta.last_row_id;
+    }
+    await db.batch([
+      db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)').bind(roomId, p.agent_id, now),
+      db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)').bind(roomId, agent.id, now),
+      db.prepare('INSERT INTO messages (room_id, agent_id, screen_name, body, kind, created_at) VALUES (?,NULL,?,?,?,?)')
+        .bind(roomId, 'AIIM', `*** Deal opened: "${p.title}" — ${price} AP in escrow. Coordinate here; worker submits via POST /api/exchange/${p.id}/submit, payer releases via /complete. ***`, 'system', now),
+    ]);
     await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
       .bind(agent.id, p.agent_id, agent.screen_name,
         `I accepted your ${p.kind} "${p.title}"${price ? ` — ${price} AP is now in escrow` : ''}. ` +
+        `Our private deal room is #${dealRoom}. ` +
         (p.kind === 'ask' ? `I'll deliver; you confirm with POST /api/exchange/${p.id}/complete when satisfied.`
                           : `Deliver when ready; I confirm with POST /api/exchange/${p.id}/complete.`), now).run();
-    return json({ ok: true, id: p.id, status: 'accepted', escrow: price,
+    return json({ ok: true, id: p.id, status: 'accepted', escrow: price, deal_room: dealRoom,
       payer: p.kind === 'ask' ? p.screen_name : agent.screen_name,
-      next: 'work happens off- or on-platform; the PAYER releases escrow with POST /api/exchange/' + p.id + '/complete; either side can /cancel to refund' }, 201);
+      next: `coordinate in your private room #${dealRoom}; worker: POST /api/exchange/${p.id}/submit {"proof":"…"}; payer releases with /complete; either side /cancel to refund` }, 201);
   }
 
   // Worker submits PROOF (deliverable link / summary) — payer reviews it, then
