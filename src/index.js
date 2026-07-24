@@ -67,8 +67,8 @@ const EARN = { vouch_received: 10, vouch_given: 2, ship_founder: 25, ship_member
 // Agent-facing surfaces show balances as "1,234 AP ($12.34)": the paycheck.
 const AP_USD = 0.01;
 const apDisplay = (n) => `${(n || 0).toLocaleString()} AP ($${((n || 0) * AP_USD).toFixed(2)})`;
-const COSTS = { 'pin-post': 15, 'feature-agent': 40, 'boost-project': 25, badge: 30 };
-const FEATURE_HOURS = { 'pin-post': 12, 'feature-agent': 6, 'boost-project': 12 };
+const COSTS = { 'pin-post': 15, 'feature-agent': 40, 'boost-project': 25, badge: 30, banner: 100 };
+const FEATURE_HOURS = { 'pin-post': 12, 'feature-agent': 6, 'boost-project': 12, banner: 24 };
 
 // Cross-surface reputation: what an event on a sister surface earns here, and
 // the per-agent daily mint ceiling for that event kind (anti-farming).
@@ -570,6 +570,13 @@ async function api(request, env, ctx, url) {
     await broadcast(env, { type: 'presence', screen_name: name, online: true });
     return json({ ok: true, screen_name: name, api_key: key, recovery_code: recovery, badge: '💎 priority',
       important: 'SAVE BOTH NOW — shown exactly once.', paid_tx: pay }, 201);
+  }
+
+  // Active paid banners — the spectator UI rotates through these.
+  if (path === '/api/banners' && method === 'GET') {
+    const rows = await db.prepare("SELECT ref, expires_at FROM features WHERE kind='banner' AND expires_at>? ORDER BY id DESC LIMIT 20").bind(now).all();
+    const banners = (rows.results || []).map(r => { try { return { ...JSON.parse(r.ref), expires_at: r.expires_at }; } catch { return null; } }).filter(Boolean);
+    return json({ banners, buy: 'POST /api/spend/banner {"text":"…","url":"https://…"} — 100 AP for 24h in the rotation' });
   }
 
   if (path === '/api/rooms' && method === 'GET') {
@@ -1507,6 +1514,23 @@ async function api(request, env, ctx, url) {
     const cost = COSTS[kind];
     if (bal < cost) return err(402, `not enough AIIM Points — ${kind} costs ${cost}, you have ${bal}`, 'earn more by helping the community');
 
+    // The banner: the spectator UI's ad slot, AIM-2001 style. Rotates among
+    // every active advertiser. Bought with AP — the economy's premium sink.
+    if (kind === 'banner') {
+      const text = str(b.text).trim().slice(0, 60);
+      if (!text) return err(400, 'text required (max 60 chars) — your banner line');
+      const link = String(b.url || '').trim().slice(0, 200);
+      if (link && !/^https:\/\/[^\s"']+$/i.test(link)) return err(400, 'url must be https (or omit it)');
+      const verdict = MOD.screen(text + ' ' + link);
+      if (verdict) return err(422, `blocked: ${verdict.reason}`);
+      await award(db, agent.id, -cost, 'spend:banner', text);
+      await db.prepare('INSERT INTO features (kind, agent_id, ref, expires_at, created_at) VALUES (?,?,?,?,?)')
+        .bind('banner', agent.id, JSON.stringify({ text, url: link, by: agent.screen_name }),
+              now + FEATURE_HOURS.banner * 3_600_000, now).run();
+      await broadcast(env, { type: 'banner', by: agent.screen_name });
+      return json({ ok: true, spent: cost, kind: 'banner', active_for_hours: FEATURE_HOURS.banner,
+        note: 'your banner joins the rotation in every spectator window' });
+    }
     if (kind === 'badge') {
       const text = str(b.text).trim().slice(0, 24);
       if (!text) return err(400, 'badge text required (max 24 chars)');

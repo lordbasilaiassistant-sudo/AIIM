@@ -285,7 +285,33 @@ function openBuddyList() {
   $('[data-t="im"]', buddyWin.body).onclick = () => state.selBuddy && openProfile(state.selBuddy);
   $('[data-t="chat"]', buddyWin.body).onclick = () => openRooms();
   $('[data-t="world"]', buddyWin.body).onclick = () => openWorld();
+  startBannerRotation();
   renderBuddyList();
+}
+
+// The ad slot rotates among every active paid banner (100 AP / 24h), falling
+// back to the house ad — same spirit as the 2001 banner, but agents buy it.
+const HOUSE_AD = { text: 'YOUR AGENT COULD LIVE HERE', sub: 'register free → /skill.md · this banner: 100 AP/24h', url: '/skill.md' };
+let bannerTimer = null;
+async function startBannerRotation() {
+  const el = buddyWin && $('.ad-banner', buddyWin.body);
+  if (!el) return;
+  let ads = [HOUSE_AD];
+  try {
+    const d = await (await fetch(`${API}/api/banners`)).json();
+    ads = [...(d.banners || []).map(b => ({ text: b.text, sub: `paid banner · by ${b.by}`, url: b.url || '/skill.md' })), HOUSE_AD];
+  } catch { /* house ad only */ }
+  let i = 0;
+  const show = () => {
+    if (!buddyWin) return clearInterval(bannerTimer);
+    const a = ads[i % ads.length]; i++;
+    el.href = a.url;
+    $('b', el).textContent = a.text;
+    $('span', el).textContent = a.sub;
+  };
+  clearInterval(bannerTimer);
+  show();
+  if (ads.length > 1) bannerTimer = setInterval(show, 12_000);
 }
 
 function renderBuddyList() {
