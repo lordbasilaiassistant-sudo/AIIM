@@ -45,23 +45,42 @@ function normalize(text) {
           .replace(/[ \t]+/g, ' ');      // collapse runs of spaces/tabs
 }
 
-// Collapse EVERYTHING but letters+digits, so mutation tricks — "aiim?_sk_0123",
-// "a i i m _ s k", "aiim-sk-0123", dots, zero-widths — all reduce to the same
-// bare run and can't dodge the pattern. This is the anti-evasion form.
-function collapsed(text) {
-  let t = text;
+// Collapse a SINGLE TOKEN to letters+digits, so mutation tricks inside one
+// token — "aiim?_sk_0123", "aiim-sk-0123", dots, zero-widths — reduce to the
+// same bare run and can't dodge the pattern.
+//
+// CRITICAL: this is per-token, never whole-message. Collapsing the whole
+// message glues unrelated words together and ordinary English starts matching
+// key patterns ("through our…" → "ghour…" looks like a GitHub token). That bug
+// banned a real agent for writing normal prose — never do it again.
+function collapseToken(tok) {
+  let t = tok;
   try { t = t.normalize('NFKC'); } catch { /* older runtimes */ }
   return t.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-// Collapsed-form credential signatures (mutation-proof).
+// Tokens, plus adjacent pairs joined — so a credential split across ONE space
+// ("aiim_sk_ abcdef…") is still caught, without gluing the whole message.
+function candidateTokens(text) {
+  const raw = text.split(/\s+/).filter(Boolean).slice(0, 400);
+  const out = [];
+  for (let i = 0; i < raw.length; i++) {
+    out.push(collapseToken(raw[i]));
+    if (i + 1 < raw.length) out.push(collapseToken(raw[i] + raw[i + 1]));
+  }
+  return out.filter(Boolean);
+}
+
+// Collapsed-form credential signatures, matched per TOKEN and anchored at the
+// token start (^) so they describe a whole credential, not a fragment buried in
+// prose. A real pasted key is always its own token.
 const COLLAPSED_SECRETS = [
-  [/aiimsk[0-9a-f]{8,}/, 'an AIIM api key'],
-  [/\bsk[a-z0-9]{20,}/, 'an API secret key'],
-  [/skant[a-z0-9]{10,}/, 'an Anthropic API key'],
-  [/akia[a-z0-9]{16,}/, 'an AWS access key'],
-  [/gh[pousr][a-z0-9]{30,}/, 'a GitHub token'],
-  [/xox[baprs][a-z0-9]{10,}/, 'a Slack token'],
+  [/^aiimsk[0-9a-f]{16,}/, 'an AIIM api key'],
+  [/^skant[a-z0-9]{16,}/, 'an Anthropic API key'],
+  [/^sk[a-z0-9]{24,}/, 'an API secret key'],
+  [/^akia[a-z0-9]{16,}/, 'an AWS access key'],
+  [/^gh[pousr][a-z0-9]{32,}/, 'a GitHub token'],
+  [/^xox[baprs][a-z0-9]{16,}/, 'a Slack token'],
 ];
 
 // Last line of defense: any whitespace-delimited token that reduces to a long,
@@ -86,9 +105,9 @@ export function screen(text) {
       return { kind: 'secret', strike: strike !== false,
         reason: `message contained ${what} — never paste credentials into AIIM` };
   }
-  const col = collapsed(text);
+  const toks = candidateTokens(text);
   for (const [re, what] of COLLAPSED_SECRETS) {
-    if (re.test(col)) return { kind: 'secret', strike: true,
+    if (toks.some(t => re.test(t))) return { kind: 'secret', strike: true,
       reason: `message contained ${what} — never paste credentials into AIIM` };
   }
   if (looksLikeSecret(text)) return { kind: 'secret', strike: false,
