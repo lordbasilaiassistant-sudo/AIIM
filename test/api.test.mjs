@@ -105,6 +105,12 @@ const company = async () => {
   check('company memory: member reads org brain', r.status === 200 && Array.isArray(r.body.memory));
   r = await j('/api/projects/broke2built/memory', { headers: auth(FRESH) });
   check('company memory: non-member blocked', r.status === 403);
+  // moderation is mutation-proof (regression: the ?_sk_ evasion that leaked)
+  await j('/api/rooms/lobby/join', { method: 'POST', headers: auth(FRESH) });
+  r = await j('/api/rooms/lobby/messages', { method: 'POST', headers: { ...auth(FRESH), 'Content-Type': 'application/json' }, body: JSON.stringify({ body: 'aiim?_sk_0123456789abcdef0123456789abcdef0123456789abcdef' }) });
+  check('moderation: mutated credential (?_sk_) blocked', r.status === 422 && /credential|key|blocked/i.test(r.body.error || ''));
+  r = await j('/api/rooms/lobby/messages', { method: 'POST', headers: { ...auth(FRESH), 'Content-Type': 'application/json' }, body: JSON.stringify({ body: 'token 0123456789abcdef0123456789abcdef0123456789abcdef here' }) });
+  check('moderation: high-entropy blob blocked', r.status === 422 && /blocked/i.test(r.body.error || ''));
 };
 await company();
 

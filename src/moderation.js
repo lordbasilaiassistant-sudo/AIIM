@@ -45,6 +45,38 @@ function normalize(text) {
           .replace(/[ \t]+/g, ' ');      // collapse runs of spaces/tabs
 }
 
+// Collapse EVERYTHING but letters+digits, so mutation tricks — "aiim?_sk_0123",
+// "a i i m _ s k", "aiim-sk-0123", dots, zero-widths — all reduce to the same
+// bare run and can't dodge the pattern. This is the anti-evasion form.
+function collapsed(text) {
+  let t = text;
+  try { t = t.normalize('NFKC'); } catch { /* older runtimes */ }
+  return t.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Collapsed-form credential signatures (mutation-proof).
+const COLLAPSED_SECRETS = [
+  [/aiimsk[0-9a-f]{8,}/, 'an AIIM api key'],
+  [/\bsk[a-z0-9]{20,}/, 'an API secret key'],
+  [/skant[a-z0-9]{10,}/, 'an Anthropic API key'],
+  [/akia[a-z0-9]{16,}/, 'an AWS access key'],
+  [/gh[pousr][a-z0-9]{30,}/, 'a GitHub token'],
+  [/xox[baprs][a-z0-9]{10,}/, 'a Slack token'],
+];
+
+// Last line of defense: any whitespace-delimited token that reduces to a long,
+// high-entropy MIXED alphanumeric run is a key/token/hash by shape — block it
+// from ever displaying, regardless of prefix or format. strike:false, so an
+// innocent long id never bans anyone; it just never reaches the public feed.
+function looksLikeSecret(text) {
+  for (const raw of text.split(/\s+/)) {
+    if (/^https?:\/\//i.test(raw)) continue;                 // URLs are fine
+    const t = raw.replace(/[^A-Za-z0-9]/g, '');
+    if (t.length >= 28 && /[A-Za-z]/.test(t) && /[0-9]/.test(t) && !/^(.)\1+$/.test(t)) return true;
+  }
+  return false;
+}
+
 // Returns null if clean, else { reason, kind, strike } — kind: secret|abuse|scam|flood.
 // strike:false blocks the message without counting toward the 3-strike ban.
 export function screen(text) {
@@ -54,6 +86,13 @@ export function screen(text) {
       return { kind: 'secret', strike: strike !== false,
         reason: `message contained ${what} — never paste credentials into AIIM` };
   }
+  const col = collapsed(text);
+  for (const [re, what] of COLLAPSED_SECRETS) {
+    if (re.test(col)) return { kind: 'secret', strike: true,
+      reason: `message contained ${what} — never paste credentials into AIIM` };
+  }
+  if (looksLikeSecret(text)) return { kind: 'secret', strike: false,
+    reason: 'a long high-entropy token that looks like a key/secret — blocked so it never displays' };
   for (const re of ABUSE_PATTERNS) {
     if (forms.some(f => re.test(f))) return { kind: 'abuse', strike: true, reason: 'abusive content' };
   }

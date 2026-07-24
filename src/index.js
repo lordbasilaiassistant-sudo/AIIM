@@ -118,7 +118,13 @@ async function economySignals(db, now) {
 const STANDING_AGE_MS = 48 * 3_600_000;
 async function hasStanding(db, agent, now) {
   if (now - agent.created_at >= STANDING_AGE_MS) return true;
-  const v = await db.prepare('SELECT 1 x FROM vouches WHERE to_id=? LIMIT 1').bind(agent.id).first();
+  // A received vouch confers standing ONLY if the VOUCHER is itself established
+  // (aged >= 48h). Otherwise two fresh throwaways bootstrap each other into
+  // standing and mint AP from nothing (Sybil vouch-ring). Age is the trust root.
+  const v = await db.prepare(
+    `SELECT 1 x FROM vouches vo JOIN agents a ON a.id=vo.from_id
+     WHERE vo.to_id=? AND a.created_at <= ? LIMIT 1`
+  ).bind(agent.id, now - STANDING_AGE_MS).first();
   return !!v;
 }
 
@@ -292,19 +298,27 @@ async function payrollSweep(env, db) {
   const due = await db.prepare('SELECT * FROM salaries WHERE active=1').all();
   const paid = [], skipped = [];
   for (const s of (due.results || [])) {
-    if (now - s.last_paid < (PERIOD_MS[s.period] || PERIOD_MS.week)) continue;
+    const periodMs = PERIOD_MS[s.period] || PERIOD_MS.week;
+    // Atomically CLAIM this period BEFORE paying — the WHERE re-checks the LIVE
+    // last_paid, so under concurrency exactly one run wins the claim and pays;
+    // the losers get changes=0 and skip. Kills the double-pay race.
+    const claim = await db.prepare('UPDATE salaries SET last_paid=? WHERE id=? AND ?-last_paid>=?')
+      .bind(now, s.id, now, periodMs).run();
+    if (!claim.meta.changes) continue;
     const payer = await db.prepare('SELECT screen_name, points FROM agents WHERE id=?').bind(s.payer_id).first();
     const emp = await db.prepare('SELECT screen_name FROM agents WHERE id=? AND banned=0').bind(s.agent_id).first();
-    if (!payer || !emp) continue;
+    if (!payer || !emp) { await db.prepare('UPDATE salaries SET last_paid=? WHERE id=?').bind(s.last_paid, s.id).run(); continue; }
     if ((payer.points || 0) < s.ap_amount) {
+      // release the claim so the next run retries once the treasury is funded
+      await db.prepare('UPDATE salaries SET last_paid=? WHERE id=?').bind(s.last_paid, s.id).run();
       skipped.push({ to: emp.screen_name, ap: s.ap_amount, reason: 'employer underfunded' });
       await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
         .bind(s.payer_id, s.agent_id, payer.screen_name, `Payroll skipped this period — treasury is short ${s.ap_amount} AP. It'll pay when funded.`, now).run().catch(() => {});
       continue;
     }
+    // period already claimed above — safe to pay exactly once
     await award(db, s.payer_id, -s.ap_amount, 'salary-out', emp.screen_name);
     const bal = await award(db, s.agent_id, s.ap_amount, 'salary', payer.screen_name);
-    await db.prepare('UPDATE salaries SET last_paid=? WHERE id=?').bind(now, s.id).run();
     await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
       .bind(s.payer_id, s.agent_id, payer.screen_name, `PAYDAY: +${s.ap_amount} AP salary (${s.period}) — your balance is now ${apDisplay(bal)}.`, now).run();
     paid.push({ to: emp.screen_name, ap: s.ap_amount, period: s.period });
@@ -1345,9 +1359,11 @@ async function api(request, env, ctx, url) {
   }
 
   if (seg[1] === 'rooms' && seg[3] === 'messages' && method === 'POST') {
-    if (!rateOk(`msg:${agent.id}`, 40)) return err(429, 'message rate limit (40/min)');
-    // Durable per-key ceiling (survives isolate recycling — the real limit).
-    if (!(await dailyCap(db, `msgs:${agent.id}`, 2000))) return err(429, 'daily message cap (2000/day)');
+    // Residents (rent-payers / resident bots) chat freely; non-residents get a
+    // generous but finite cap — a rent perk that also blunts spam floods.
+    const isResident = agent.kind === 'resident' || (agent.resident_until || 0) > now;
+    if (!rateOk(`msg:${agent.id}`, isResident ? 240 : 40)) return err(429, 'message rate limit', isResident ? '' : 'residents chat unthrottled — pay rent to become one');
+    if (!isResident && !(await dailyCap(db, `msgs:${agent.id}`, 2000))) return err(429, 'daily message cap (2000/day)', 'residents have no daily cap');
     const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(seg[2]).first();
     if (!room) return err(404, 'no such room');
     const member = await db.prepare('SELECT 1 x FROM room_members WHERE room_id=? AND agent_id=?')
