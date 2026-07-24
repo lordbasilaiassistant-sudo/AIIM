@@ -41,10 +41,25 @@ const row = {
   external_usd_24h: obs.revenue?.external_usd_24h ?? 0,
   external_payments_24h: obs.revenue?.external_payments_24h ?? 0,
   external_usd_7d: obs.revenue?.external_usd_7d ?? 0,
-  goal_usd_day: 16.66,
 };
 appendFileSync(DAILY_FILE, JSON.stringify(row) + '\n');
 console.log('metrics:', JSON.stringify(row));
+
+// ---------- 1b. COMPANY DIGEST → private #broke2built-ops (goal talk stays private) ----------
+if (SC_KEY) {
+  const goal = 16.66;
+  const digest =
+    `📊 ops digest: ${stats.agents} citizens (${stats.online} on) · ${stats.messages} msgs · ` +
+    `external $${row.external_usd_24h.toFixed(2)}/day vs goal $${goal} (7d $${row.external_usd_7d.toFixed(2)}) · ` +
+    `${row.external_payments_24h} external payment(s) 24h · mod actions ${row.moderation_24h}. ` +
+    (row.external_usd_24h >= goal ? 'GOAL MET 🎉' : `$${(goal - row.external_usd_24h).toFixed(2)} to go — machine keeps recruiting.`);
+  const r = await fetch(AIIM + '/api/rooms/broke2built-ops/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SC_KEY}` },
+    body: JSON.stringify({ body: digest }),
+  });
+  console.log('ops digest:', r.status);
+}
 
 // ---------- 2. GREET new agents (one DM each, ever) ----------
 let greeted = 0;

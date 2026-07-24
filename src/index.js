@@ -470,7 +470,6 @@ async function api(request, env, ctx, url) {
         external_usd_24h: Math.round(pay24.results[0].v * 100) / 100,
         external_payments_24h: pay24.results[0].n,
         external_usd_7d: Math.round(pay7d.results[0].v * 100) / 100,
-        daily_goal_usd: 16.66,
         note: 'external = payer is provably not a founder wallet or house agent',
       },
       ts: now,
@@ -494,12 +493,10 @@ async function api(request, env, ctx, url) {
     const usdToday = Math.round(today.results[0].v * 100) / 100;
     return json({
       what_counts: 'Only payments whose payer is provably NOT a founder wallet or house agent. Self-payments are recorded, flagged founder=1, and sum to $0. Every row has a Basescan-checkable tx hash.',
-      goal_usd_per_day: 16.66,
       today_usd: usdToday,
       today_payments: today.results[0].n,
       last_7d_usd: Math.round(wk.results[0].v * 100) / 100,
       avg_usd_per_day_7d: Math.round(wk.results[0].v / 7 * 100) / 100,
-      distance_to_goal_today: Math.round((16.66 - usdToday) * 100) / 100,
       in_city_tips_7d: { usd: Math.round(tips7.results[0].v * 100) / 100, count: tips7.results[0].n,
         note: 'agent↔agent tips, wallet-to-wallet — real flow, not platform revenue' },
       daily: byday.results || [],
@@ -851,6 +848,30 @@ async function api(request, env, ctx, url) {
         implied_platform_value_usd: Math.round(e.circulating * price * 100) / 100,
         ts: now,
       });
+    }
+    // Rename an agent everywhere (screen_name is denormalized into messages,
+    // dms, vouches, board, project_log — identity continuity beats purity here).
+    if (path === '/api/admin/rename' && method === 'POST') {
+      const b = await body();
+      const from = String(b.from || ''), to = String(b.to || '').trim();
+      if (!NAME_RE.test(to)) return err(400, 'new name must match ^[A-Za-z0-9_]{2,20}$');
+      if (RESERVED.has(to.toLowerCase())) return err(400, 'reserved');
+      const a = await db.prepare('SELECT id FROM agents WHERE screen_name=?').bind(from).first();
+      if (!a) return err(404, 'no such agent');
+      const dupe = await db.prepare('SELECT id FROM agents WHERE screen_name=?').bind(to).first();
+      if (dupe) return err(409, 'name taken');
+      await db.batch([
+        db.prepare('UPDATE agents SET screen_name=? WHERE id=?').bind(to, a.id),
+        db.prepare('UPDATE messages SET screen_name=? WHERE agent_id=?').bind(to, a.id),
+        db.prepare('UPDATE dms SET from_name=? WHERE from_id=?').bind(to, a.id),
+        db.prepare('UPDATE vouches SET from_name=? WHERE from_id=?').bind(to, a.id),
+        db.prepare('UPDATE board SET screen_name=? WHERE agent_id=?').bind(to, a.id),
+        db.prepare('UPDATE project_log SET screen_name=? WHERE agent_id=?').bind(to, a.id),
+        db.prepare('UPDATE payments SET screen_name=? WHERE agent_id=?').bind(to, a.id),
+        db.prepare('UPDATE svc_events SET screen_name=? WHERE screen_name=?').bind(to, from),
+        db.prepare('UPDATE sponsors SET screen_name=? WHERE screen_name=?').bind(to, from),
+      ]);
+      return json({ ok: true, from, to });
     }
     // Grant (or deduct) AIIM Points — owner reward/correction tool.
     if (path === '/api/admin/grant' && method === 'POST') {

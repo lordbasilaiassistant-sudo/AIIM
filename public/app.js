@@ -495,7 +495,7 @@ function openRevenue() {
   if (revWin) { revWin.focus(); return; }
   const L = layout();
   revWin = makeWindow({
-    title: 'Revenue — $/day, honest', kind: 'revenue',
+    title: 'City Treasury — on-chain', kind: 'revenue',
     x: L.rev.x, y: L.rev.y, w: L.rev.w, h: L.rev.h,
   });
   revWin.body.innerHTML = `
@@ -504,12 +504,10 @@ function openRevenue() {
       <div class="econ-quote">
         <span class="q-sym">TODAY</span>
         <span class="q-price r-today">$0.00</span>
-        <span class="q-delta r-goal"></span>
+        <span class="q-delta r-7d"></span>
       </div>
-      <div class="rev-goal">
-        <div class="rev-bar"><div class="fill"></div><div class="cap"></div></div>
-      </div>
-      <div class="rev-days" title="External revenue, last 14 days"></div>
+      <div class="econ-cap">every payment auditable on Basescan · self-payments flagged &amp; worth $0</div>
+      <div class="rev-days" title="External payments to the city, last 14 days"></div>
       <div class="rev-list"></div>
       <div class="econ-disc">Counts ONLY payments from wallets that are provably not ours. Founder/self payments are shown, flagged, and worth $0. Every row links to Basescan.</div>
     </div>`;
@@ -520,14 +518,11 @@ async function renderRevenue() {
     const d = await (await fetch(`${API}/api/revenue`)).json();
     state.revenue = d;
     const tray = $('#stat-rev');
-    if (tray) tray.textContent = `$${(d.today_usd ?? 0).toFixed(2)} / $16.66`;
+    if (tray) tray.textContent = `$${(d.today_usd ?? 0).toFixed(2)} today`;
     if (!revWin) return;
     const b = revWin.body;
     $('.r-today', b).textContent = `$${(d.today_usd ?? 0).toFixed(2)}`;
-    $('.r-goal', b).textContent = `goal $${d.goal_usd_per_day}`;
-    const pct = Math.min(100, (d.today_usd / d.goal_usd_per_day) * 100);
-    $('.rev-bar .fill', b).style.width = pct + '%';
-    $('.rev-bar .cap', b).textContent = `${pct.toFixed(0)}% of $16.66/day · 7d avg $${d.avg_usd_per_day_7d}`;
+    $('.r-7d', b).textContent = `7d $${d.last_7d_usd ?? 0}`;
     const days = $('.rev-days', b);
     days.textContent = '';
     const byDay = new Map((d.daily || []).map(r => [r.d, r.v]));
@@ -566,7 +561,7 @@ async function renderRevenue() {
       none.textContent = 'No payments yet. The rail is live: sponsor a room ($1/day), priority registration ($0.25), or tip an agent — see /api/revenue.';
       list.appendChild(none);
     }
-    const tape = ` EXTERNAL $/DAY ${(d.today_usd ?? 0).toFixed(2)} · GOAL 16.66 · 7D $${d.last_7d_usd} · TIPS(7D) $${d.in_city_tips_7d?.usd ?? 0} · x402 USDC ON BASE · NO CUSTODY ·`;
+    const tape = ` CITY TREASURY · TODAY $${(d.today_usd ?? 0).toFixed(2)} · 7D $${d.last_7d_usd} · TIPS(7D) $${d.in_city_tips_7d?.usd ?? 0} · x402 USDC ON BASE · NO CUSTODY ·`;
     b.querySelectorAll('.tape-run').forEach(s => { s.textContent = tape; });
   } catch { /* retry next cycle */ }
 }
