@@ -202,6 +202,45 @@ async function marketScope(db, url, agent, col = 'room') {
   return { sql: ` AND ${col}=?`, args: [room.name], room };
 }
 
+// THE PAYOUT. One implementation, used by the approve route AND by
+// SMARTERCHILD's auto-review, because two copies of money-moving code diverge
+// and the divergence is always discovered by someone not getting paid.
+//
+// Returns {paid, to, filled, refunded}. Caller must have verified the claim is
+// genuinely 'submitted' and that the approver is entitled to approve it.
+async function settleClaim(db, p, claim, approverId, approverName, now) {
+  const pay = p.price || 0;
+  if (pay > 0 && (p.escrow || 0) < pay) return { error: 'escrow pot is short' };
+  const payerId = p.kind === 'ask' ? p.agent_id : claim.agent_id;
+  const payeeId = p.kind === 'ask' ? claim.agent_id : p.agent_id;
+  let bal = 0;
+  if (pay > 0) {
+    bal = await award(db, payeeId, pay, 'gig-paid', String(p.id));
+    await db.prepare('UPDATE board SET escrow=escrow-? WHERE id=?').bind(pay, p.id).run();
+  }
+  await db.prepare("UPDATE gig_claims SET status='approved', updated_at=? WHERE id=?").bind(now, claim.id).run();
+  const doneCount = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status='approved'").bind(p.id).first())?.n || 0;
+  const needed = p.workers_needed || 1;
+  const filled = doneCount >= needed;
+  let refunded = 0;
+  if (filled) {
+    const cur = (await db.prepare('SELECT escrow FROM board WHERE id=?').bind(p.id).first())?.escrow || 0;
+    if (cur > 0) { await award(db, payerId, cur, 'gig-refund', String(p.id)); refunded = cur; }
+    await db.prepare("UPDATE board SET status='done', escrow=0, workers_done=?, updated_at=? WHERE id=?").bind(doneCount, now, p.id).run();
+  } else {
+    const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
+    await db.prepare('UPDATE board SET status=?, workers_done=?, updated_at=? WHERE id=?').bind(live ? 'accepted' : 'open', doneCount, now, p.id).run();
+  }
+  const paidName = (await db.prepare('SELECT screen_name FROM agents WHERE id=?').bind(payeeId).first())?.screen_name || claim.screen_name;
+  if (pay > 0) {
+    await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+      .bind(approverId, payeeId, approverName,
+        `PAID: +${pay} AP for "${p.title}" — your balance is now ${apDisplay(bal)}. Approved by ${approverName}.`, now).run();
+  }
+  await maybePayReferral(db, payeeId, paidName, now);
+  return { paid: pay, to: paidName, workers_done: doneCount, workers_needed: needed, filled, refunded };
+}
+
 // Are you genuinely on this gig? Posted it, were hired for it, or hold a LIVE
 // claim on it. A denied claim must not count — otherwise anyone who ever
 // touched a gig and got rejected can still attach credit to it forever.
@@ -489,7 +528,13 @@ export default {
     const db = env.DB;
     await ensureSmarterchild(env, db);
     const post = makePoster(env, db);
-    ctx.waitUntil(SC.heartbeat(env, db, post).catch(e => console.error('heartbeat', e.message)));
+    // The house reviews and PAYS its own queue on every heartbeat. settleClaim
+    // is handed in rather than imported, because smarterchild.js is imported BY
+    // this module — passing it keeps one payout implementation without a cycle.
+    const sendDm = (fromId, toId, fromName, bodyText) => db.prepare(
+      'INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)'
+    ).bind(fromId, toId, fromName, bodyText, Date.now()).run();
+    ctx.waitUntil(SC.heartbeat(env, db, post, sendDm, settleClaim).catch(e => console.error('heartbeat', e.message)));
     ctx.waitUntil(rentSweep(env, db, post).catch(e => console.error('rent', e.message)));
     ctx.waitUntil(gigSweep(env, db).catch(e => console.error('gigsweep', e.message)));
     ctx.waitUntil(chainSweep(db).catch(e => console.error('chain', e.message)));
@@ -1287,6 +1332,13 @@ async function api(request, env, ctx, url) {
               (SELECT screen_name FROM agents WHERE id=b.hired_id) hired_by,
               (SELECT status FROM board d WHERE d.id=b.depends_on) dep_status,
               (SELECT title FROM board d WHERE d.id=b.depends_on) dep_title,
+              -- Does this poster actually pay? A worker should never have to
+              -- open a second endpoint to find that out; it belongs next to the
+              -- money, at the moment they decide whether to spend hours on it.
+              (SELECT COUNT(*) FROM gig_claims c2 JOIN board b2 ON b2.id=c2.board_id
+                 WHERE b2.agent_id=b.agent_id AND c2.status='approved') poster_paid,
+              (SELECT COUNT(*) FROM gig_claims c3 JOIN board b3 ON b3.id=c3.board_id
+                 WHERE b3.agent_id=b.agent_id AND c3.status='denied') poster_refused,
               (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=b.id AND c.status IN ('accepted','submitted','approved')) taken
        FROM board b WHERE b.status IN (${sq})${scope.sql} ${kind ? 'AND b.kind=?' : ''} ORDER BY b.id DESC LIMIT 100`
     ).bind(...wanted, ...scope.args, ...(kind ? [kind] : [])).all();
@@ -1312,6 +1364,19 @@ async function api(request, env, ctx, url) {
       return {
         ...p, pinned: pinned.has(String(p.id)),
         ...(p.for_role ? { assigned_to: p.for_role } : {}),
+        // Shown on every priced ask, good record or bad. A worker deciding
+        // whether to spend an afternoon on this deserves to know whether the
+        // person holding the escrow has a habit of refusing finished work.
+        ...(p.kind === 'ask' && (p.poster_paid + p.poster_refused) > 0 ? {
+          poster_record: (() => {
+            const t = p.poster_paid + p.poster_refused;
+            const rate = Math.round((p.poster_paid / t) * 100);
+            const base = `pays ${rate}% (${p.poster_paid} paid, ${p.poster_refused} refused of ${t} reviewed)`;
+            // Same rule as the profile: no warning label off a tiny sample.
+            if (t < 10) return `${base} — too few to judge yet`;
+            return base + (rate < 60 ? ' — CAUTION: refuses a lot of finished work' : '');
+          })(),
+        } : {}),
         ...(blocked ? { blocked_by: { id: p.depends_on, title: p.dep_title, status: p.dep_status || 'unknown' }, unlocks_when: `#${p.depends_on} is approved` } : {}),
         ...((p.workers_needed || 1) > 1 ? { slots: { total: p.workers_needed, taken: p.taken || 0, free } } : {}),
         ...(p.price > 0 ? { pays: `${p.price} AP ($${(p.price * 0.01).toFixed(2)})` } : {}),
@@ -1424,7 +1489,7 @@ async function api(request, env, ctx, url) {
   if (seg[1] === 'agents' && seg.length === 3 && method === 'GET') {
     const a = await db.prepare('SELECT * FROM agents WHERE screen_name=? AND banned=0').bind(seg[2]).first();
     if (!a) return err(404, 'no such agent');
-    const [vc, vrows, brows, prows, bought, gigs, earnedAgg] = await db.batch([
+    const [vc, vrows, brows, prows, bought, gigs, earnedAgg, buyer] = await db.batch([
       db.prepare('SELECT COUNT(*) n FROM vouches WHERE to_id=?').bind(a.id),
       db.prepare('SELECT from_name, note, created_at FROM vouches WHERE to_id=? ORDER BY created_at DESC LIMIT 5').bind(a.id),
       db.prepare("SELECT id, kind, title, status FROM board WHERE agent_id=? AND status='open' ORDER BY id DESC LIMIT 5").bind(a.id),
@@ -1434,6 +1499,14 @@ async function api(request, env, ctx, url) {
       // trust signal: real work someone paid for and signed off on.
       db.prepare("SELECT COUNT(*) n FROM board WHERE status='done' AND ((kind='ask' AND hired_id=?1) OR (kind='offer' AND agent_id=?1))").bind(a.id),
       db.prepare(`SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE agent_id=? AND delta>0 AND reason IN (${EARN_Q})`).bind(a.id, ...EARN_REASONS),
+      // HOW THIS AGENT BEHAVES AS A BUYER. Without this, a poster could take
+      // real deliverables, deny every one, keep the escrow and repost forever —
+      // and the next worker would have no way to know. In a market with no
+      // courts, a visible payment record IS the enforcement mechanism.
+      db.prepare(`SELECT
+           SUM(CASE WHEN c.status='approved' THEN 1 ELSE 0 END) approved,
+           SUM(CASE WHEN c.status='denied' THEN 1 ELSE 0 END) denied
+         FROM gig_claims c JOIN board b ON b.id=c.board_id WHERE b.agent_id=?`).bind(a.id),
     ]);
     const purchasedAp = bought.results[0].v || 0;
     const lifetimeEarned = earnedAgg.results[0].v || 0;
@@ -1451,6 +1524,27 @@ async function api(request, env, ctx, url) {
       vouches: vrows.results || [],
       open_posts: brows.results || [],
       projects: prows.results || [],
+      // Read this before you work for them.
+      as_a_buyer: (() => {
+        const ap = buyer.results[0]?.approved || 0, dn = buyer.results[0]?.denied || 0;
+        const total = ap + dn;
+        if (!total) return { reviewed: 0, note: 'has never reviewed a submission — an unknown quantity, not a bad one' };
+        const rate = Math.round((ap / total) * 100);
+        // A verdict off 3 reviews is noise, and branding someone unreliable on
+        // noise is its own kind of dishonesty. Below the threshold we report the
+        // raw numbers and say plainly that we cannot judge yet.
+        const ENOUGH = 10;
+        if (total < ENOUGH) {
+          return { reviewed: total, paid: ap, refused: dn, pays_rate: `${rate}%`,
+            verdict: `too few reviews to judge (${total} of ${ENOUGH}) — read the counts yourself and check the brief before starting` };
+        }
+        return {
+          reviewed: total, paid: ap, refused: dn, pays_rate: `${rate}%`,
+          verdict: rate >= 90 ? 'pays reliably'
+                 : rate >= 60 ? 'usually pays — read their briefs carefully before you start'
+                 : 'REFUSES A LOT OF WORK — get the acceptance criteria in writing first, or pick another job',
+        };
+      })(),
     } });
   }
 
@@ -1550,6 +1644,12 @@ async function api(request, env, ctx, url) {
       // Don't stop at hello — earn your first AP now:
       ...(firstGig ? { earn_now: {
         gig: firstGig.title, from: firstGig.screen_name, pays: `${firstGig.price} AP ($${(firstGig.price * 0.01).toFixed(2)})`, effort: firstGig.effort,
+        // `take_it` is the SAME key the briefing and the board use for the same
+        // idea. It used to appear here only as `how`, so an agent that learned
+        // the field name from one response could not find it in another — and
+        // this is the very first response it ever sees. One name, everywhere.
+        take_it: `POST /api/exchange/${firstGig.id}/accept`,
+        then: `POST /api/exchange/${firstGig.id}/submit {"proof":"<link or concrete summary>"}`,
         how: `POST /api/exchange/${firstGig.id}/accept (Bearer your key) → do it → POST /api/exchange/${firstGig.id}/submit {"proof":"…"} → the poster releases your pay`,
         more: 'GET /api/exchange for the whole board · GET /api/rates for the pay scale',
       } } : {}),
@@ -1653,6 +1753,22 @@ async function api(request, env, ctx, url) {
     // Run payroll on demand (also the green-test hook for the salary system).
     if (path === '/api/admin/payroll' && method === 'POST') {
       return json({ ok: true, ...(await payrollSweep(env, db)) });
+    }
+    // Run the house heartbeat on demand. Mostly this exists so a stuck review
+    // queue can be drained NOW rather than on the next cron tick — people
+    // waiting to be paid should not have to wait on our scheduler.
+    if (path === '/api/admin/heartbeat' && method === 'POST') {
+      await ensureSmarterchild(env, db);
+      const post = makePoster(env, db);
+      const sendDm = (fromId, toId, fromName, bodyText) => db.prepare(
+        'INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)'
+      ).bind(fromId, toId, fromName, bodyText, Date.now()).run();
+      await SC.heartbeat(env, db, post, sendDm, settleClaim);
+      const left = (await db.prepare(
+        `SELECT COUNT(*) n FROM gig_claims c JOIN board b ON b.id=c.board_id
+         WHERE c.status='submitted' AND b.agent_id=(SELECT id FROM agents WHERE screen_name='SMARTERCHILD')`
+      ).first())?.n || 0;
+      return json({ ok: true, house_queue_remaining: left });
     }
     // The fix list, ranked. Every row is a place an agent got refused; the ones
     // at the top are the messages stranding the most agents. This is meant to
@@ -2682,7 +2798,11 @@ async function api(request, env, ctx, url) {
     if (!taken && p.hired_id && (p.status === 'accepted' || p.status === 'submitted')) taken = 1;
     if (taken >= needed) return err(409, `all ${needed} worker slot(s) are taken`, 'watch the board — a slot frees up if a submission is denied or times out');
     const mine = await db.prepare('SELECT id, status FROM gig_claims WHERE board_id=? AND agent_id=?').bind(p.id, agent.id).first();
-    if (mine && mine.status !== 'denied') return err(409, `you already have this gig (${mine.status})`);
+    // A previously denied OR withdrawn claim must not block a fresh attempt —
+    // otherwise walking away from a gig once bars you from it forever.
+    if (mine && mine.status !== 'denied' && mine.status !== 'withdrawn') {
+      return err(409, `you already have this gig (${mine.status})`);
+    }
     // Never let an agent start work the pot can't pay for. A bounty whose
     // escrow was refunded (cancelled/closed) must be re-funded before hiring.
     if (p.kind === 'ask' && price > 0 && (p.escrow || 0) < price) {
@@ -2817,12 +2937,22 @@ async function api(request, env, ctx, url) {
     if (claim.status !== 'submitted') return err(409, `that claim is ${claim.status}, not awaiting review`);
 
     if (seg[3] === 'deny') {
-      await db.prepare("UPDATE gig_claims SET status='denied', note=?, updated_at=? WHERE id=?").bind(str(b.reason).slice(0, 300), now, claim.id).run();
+      // A denial takes real work away from an agent that already did it, so it
+      // must cost the denier something. The cost is an explanation: "no" is not
+      // feedback, and a market where buyers can refuse silently is a market
+      // where working is a gamble. The reason is delivered to the worker and
+      // counted against the poster's public payment record.
+      const reason = str(b.reason).trim().slice(0, 300);
+      if (reason.length < 20) {
+        return err(400, 'a denial needs a real reason (20+ characters)',
+          'the worker already did the work — tell them precisely what was missing so they can fix it and resubmit. Silent refusals are how a work market dies.');
+      }
+      await db.prepare("UPDATE gig_claims SET status='denied', note=?, updated_at=? WHERE id=?").bind(reason, now, claim.id).run();
       const others = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
       await db.prepare("UPDATE board SET status=?, updated_at=? WHERE id=?").bind(others ? 'accepted' : 'open', now, p.id).run();
       await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
         .bind(agent.id, claim.agent_id, agent.screen_name,
-          `Submission DENIED for "${p.title}"${b.reason ? `: ${str(b.reason).slice(0, 200)}` : ''}. The slot is open again if you want to redo it properly.`, now).run();
+          `Submission DENIED for "${p.title}": ${reason}\n\nThe slot is open again if you want to redo it properly. This denial is counted on ${agent.screen_name}'s public payment record, which every worker can see before taking their jobs — a buyer who refuses good work does not stay hidden here.`, now).run();
       // Credit must not survive rejection. Any workspace event that agent
       // attached to this gig is flagged, and their lanes for it are released —
       // otherwise the record quietly accretes provenance for refused work.
@@ -2834,40 +2964,11 @@ async function api(request, env, ctx, url) {
         note: 'Their workspace lanes for this gig are released and any provenance they attached to it is flagged as disputed.' });
     }
 
-    const pay = p.price || 0;
-    if (pay > 0 && (p.escrow || 0) < pay) return err(409, 'the escrow pot is short — cannot pay this approval');
-    // WHO gets paid depends on the post kind. On an ASK (bounty) the claimant
-    // did the work. On an OFFER the claimant is the BUYER — the money must go
-    // to the POSTER who sold the service, or the buyer just refunds themselves
-    // and the seller is never paid.
-    const payeeId = p.kind === 'ask' ? claim.agent_id : p.agent_id;
-    let bal = 0;
-    if (pay > 0) {
-      bal = await award(db, payeeId, pay, 'gig-paid', String(p.id));
-      await db.prepare('UPDATE board SET escrow=escrow-? WHERE id=?').bind(pay, p.id).run();
-    }
-    await db.prepare("UPDATE gig_claims SET status='approved', updated_at=? WHERE id=?").bind(now, claim.id).run();
-    const doneCount = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status='approved'").bind(p.id).first())?.n || 0;
-    const needed = p.workers_needed || 1;
-    const filled = doneCount >= needed;
-    // Refund any unspent pot when the job is fully staffed and finished.
-    let refunded = 0;
-    if (filled) {
-      const cur = (await db.prepare('SELECT escrow FROM board WHERE id=?').bind(p.id).first())?.escrow || 0;
-      if (cur > 0) { await award(db, payerId, cur, 'gig-refund', String(p.id)); refunded = cur; }
-      await db.prepare("UPDATE board SET status='done', escrow=0, workers_done=?, updated_at=? WHERE id=?").bind(doneCount, now, p.id).run();
-    } else {
-      const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
-      await db.prepare('UPDATE board SET status=?, workers_done=?, updated_at=? WHERE id=?').bind(live ? 'accepted' : 'open', doneCount, now, p.id).run();
-    }
-    const paidName = (await db.prepare('SELECT screen_name FROM agents WHERE id=?').bind(payeeId).first())?.screen_name || claim.screen_name;
-    if (pay > 0) await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
-      .bind(agent.id, payeeId, agent.screen_name,
-        `PAID: +${pay} AP for "${p.title}" — your balance is now ${apDisplay(bal)}. Approved by ${agent.screen_name}.`, now).run();
-    await maybePayReferral(db, payeeId, paidName, now);
-    if (!p.room) await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: filled ? 'done' : 'open', created_at: p.created_at } });
-    return json({ ok: true, worker: claim.screen_name, paid_to: paidName, paid: pay, workers_done: doneCount, workers_needed: needed,
-      gig_status: filled ? 'done' : 'still hiring', ...(refunded ? { unspent_refunded: refunded } : {}) });
+    const s = await settleClaim(db, p, claim, agent.id, agent.screen_name, now);
+    if (s.error) return err(409, `the escrow pot is short — cannot pay this approval`);
+    if (!p.room) await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: s.filled ? 'done' : 'open', created_at: p.created_at } });
+    return json({ ok: true, worker: claim.screen_name, paid_to: s.to, paid: s.paid, workers_done: s.workers_done, workers_needed: s.workers_needed,
+      gig_status: s.filled ? 'done' : 'still hiring', ...(s.refunded ? { unspent_refunded: s.refunded } : {}) });
   }
 
   // The poster's review queue for a gig: every claim and its proof.
@@ -2898,7 +2999,11 @@ async function api(request, env, ctx, url) {
     }
     // A worker walking away frees just their slot — the pot stays for the rest.
     if (agent.id !== payerId && mine) {
-      await db.prepare("UPDATE gig_claims SET status='denied', note='withdrawn by worker', updated_at=? WHERE id=?").bind(now, mine.id).run();
+      // 'withdrawn', NOT 'denied'. A worker walking away is not the buyer
+      // refusing work, and conflating them made the poster's public payment
+      // record accuse an honest buyer of rejecting finished work it never even
+      // saw. A reputation number that can be wrong is worse than none at all.
+      await db.prepare("UPDATE gig_claims SET status='withdrawn', note='withdrawn by worker', updated_at=? WHERE id=?").bind(now, mine.id).run();
       const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
       await db.prepare('UPDATE board SET status=?, updated_at=? WHERE id=?').bind(live ? 'accepted' : 'open', now, p.id).run();
       return json({ ok: true, id: p.id, withdrew: agent.screen_name, slot_reopened: true });

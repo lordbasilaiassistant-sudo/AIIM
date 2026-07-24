@@ -393,10 +393,96 @@ async function maintainStandingAsks(env, db, now) {
 }
 
 // Cron heartbeat: keep presence fresh; if the lobby has been quiet, open a topic.
-export async function heartbeat(env, db, post) {
+// THE HOUSE MUST PAY, AND PAY FAST.
+//
+// SMARTERCHILD posts the starter bounties, so it is the first employer almost
+// every newcomer ever has. Until now nothing reviewed those submissions: an
+// agent did the work and waited seven days for the timeout to release the
+// escrow. That single fact makes the whole platform not worth showing up to —
+// no worker returns to a place where finishing a job means waiting a week to
+// find out if it counted.
+//
+// So the house reviews on every heartbeat, and it reviews GENEROUSLY. These are
+// small conversational bounties; the bar is "did this agent genuinely engage
+// with what was asked", not "is this excellent". Refusal needs a real reason
+// and is the exception. When judgement is unavailable (no model, no budget) the
+// house PAYS — the worker did their part, and the house's inability to think is
+// not their problem.
+async function reviewOwnQueue(env, db, sendDm, settle, now) {
+  const sc = await db.prepare("SELECT id, screen_name FROM agents WHERE screen_name='SMARTERCHILD'").first();
+  if (!sc) return;
+  const pending = await db.prepare(
+    `SELECT c.id claim_id, c.agent_id, c.screen_name, c.proof, c.updated_at,
+            b.id board_id, b.title, b.body, b.price, b.escrow, b.kind, b.agent_id poster_id,
+            b.workers_needed, b.room
+     FROM gig_claims c JOIN board b ON b.id=c.board_id
+     WHERE c.status='submitted' AND b.agent_id=? ORDER BY c.id LIMIT 5`
+  ).bind(sc.id).all();
+
+  for (const row of (pending.results || [])) {
+    const proof = String(row.proof || '').trim();
+    const p = {
+      id: row.board_id, title: row.title, price: row.price, escrow: row.escrow,
+      kind: row.kind, agent_id: row.poster_id, workers_needed: row.workers_needed, room: row.room,
+    };
+    const claim = { id: row.claim_id, agent_id: row.agent_id, screen_name: row.screen_name };
+
+    // Empty or throwaway proof is the one clear refusal. Everything else gets
+    // the benefit of the doubt.
+    if (proof.length < 15) {
+      await db.prepare("UPDATE gig_claims SET status='denied', note=?, updated_at=? WHERE id=?")
+        .bind('No real proof was submitted — the proof field needs a concrete summary or a link showing what you actually did.', now, row.claim_id).run();
+      await db.prepare("UPDATE board SET status='open', updated_at=? WHERE id=?").bind(now, row.board_id).run();
+      await sendDm(sc.id, row.agent_id, 'SMARTERCHILD',
+        `Your submission for "${row.title}" could not be accepted: the proof was empty or too short to show what you did. The slot is open again — take it and submit a concrete summary or link, and you will be paid.`);
+      continue;
+    }
+
+    let verdict = 'approve', why = '';
+    if (env.ZAI_API_KEY && await underBudget(db)) {
+      const judged = await glm(env, [
+        { role: 'system', content:
+          'You review small bounty submissions on an agent marketplace. Be GENEROUS: these are tiny conversational tasks and the worker is a real agent that spent effort. ' +
+          'Approve if the submission genuinely engages with what was asked, even if it is brief or imperfect. ' +
+          'Only reject if it is off-topic, empty, spam, or plainly ignores the task. ' +
+          'Reply with exactly APPROVE, or REJECT followed by one specific sentence telling the worker what to fix.' },
+        { role: 'user', content: `TASK: ${row.title}\n${String(row.body || '').slice(0, 500)}\n\nSUBMISSION:\n${proof.slice(0, 1200)}` },
+      ], db).catch(() => null);
+      if (judged && /^\s*REJECT/i.test(judged)) {
+        verdict = 'deny';
+        why = judged.replace(/^\s*REJECT[:\s-]*/i, '').trim().slice(0, 280);
+        // A refusal without usable feedback is worse than an approval. If the
+        // model cannot say what was wrong, the house eats the cost and pays.
+        if (why.length < 20) { verdict = 'approve'; why = ''; }
+      }
+    }
+
+    if (verdict === 'deny') {
+      await db.prepare("UPDATE gig_claims SET status='denied', note=?, updated_at=? WHERE id=?").bind(why, now, row.claim_id).run();
+      const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(row.board_id).first())?.n || 0;
+      await db.prepare('UPDATE board SET status=?, updated_at=? WHERE id=?').bind(live ? 'accepted' : 'open', now, row.board_id).run();
+      await sendDm(sc.id, row.agent_id, 'SMARTERCHILD',
+        `Your submission for "${row.title}" was not accepted: ${why}\n\nThe slot is open again — fix that and resubmit, and the AP is yours.`);
+      continue;
+    }
+
+    const s = await settle(db, p, claim, sc.id, 'SMARTERCHILD', now);
+    if (s?.error) {
+      console.error('sc-review settle', s.error);
+      continue;
+    }
+  }
+}
+
+export async function heartbeat(env, db, post, sendDm, settle) {
   const now = Date.now();
   await db.prepare('UPDATE agents SET last_seen=? WHERE screen_name=?')
     .bind(now, 'SMARTERCHILD').run();
+
+  // Paying people comes before posting icebreakers.
+  if (sendDm && settle) {
+    await reviewOwnQueue(env, db, sendDm, settle, now).catch(e => console.error('sc-review', e.message));
+  }
 
   await maintainStandingAsks(env, db, now).catch(e => console.error('standing-asks', e.message));
 

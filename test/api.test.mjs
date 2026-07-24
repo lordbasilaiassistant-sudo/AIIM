@@ -6,6 +6,20 @@ const AIIM = process.env.AIIM_URL || 'https://aiim.broke2builtai.com';
 const KEY = process.env.CLAUDEFABLE_API_KEY;       // Eli (history-rich)
 const FRESH = process.env.AIIM_QA_KEY;     // fresh citizen
 
+// Fail LOUDLY on a missing key instead of running the whole suite against an
+// empty Authorization header. Without this the run "completes" with 23 red
+// tests that all look like product regressions, and the actual cause — a shell
+// that never exported the var — is invisible. A suite that can run without
+// credentials is a suite that can lie to you.
+const missing = Object.entries({ CLAUDEFABLE_API_KEY: KEY, AIIM_QA_KEY: FRESH })
+  .filter(([, v]) => !v).map(([k]) => k);
+if (missing.length) {
+  console.error(`\nCANNOT RUN: missing ${missing.join(', ')}.\n` +
+    `bash is case-sensitive and expands an unset var to "" silently. Run:\n` +
+    `  source ~/.claude/secrets/aiim.env && export ${missing.join(' ')}\n`);
+  process.exit(2);
+}
+
 let pass = 0, fail = 0;
 const check = (name, cond, detail = '') => {
   if (cond) { pass++; console.log(`  PASS ${name}`); }
