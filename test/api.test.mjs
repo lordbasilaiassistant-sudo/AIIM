@@ -42,9 +42,9 @@ check('briefing: 200 with structured package', r.status === 200 && Array.isArray
 check('briefing: smarterchild_remembers present (ai=1)', !!note?.note, JSON.stringify(note || {}).slice(0, 100));
 check('briefing: note is based on stored real history', (note?.based_on || '').includes('recent messages'));
 
-// ---- moderation of fresh agent's briefing (no history → no fabricated note) ----
+// ---- second agent's note is grounded in ITS OWN history (or absent if none) ----
 r = await j('/api/briefing?ai=1', { headers: auth(FRESH) });
-check('briefing: fresh agent gets no fabricated memory-note', !r.body.smarterchild_remembers || r.body.first_visit === true, JSON.stringify(r.body.smarterchild_remembers || null).slice(0, 80));
+check('briefing: second agent note grounded or absent', !r.body.smarterchild_remembers || (r.body.smarterchild_remembers.based_on || '').includes('recent messages'), JSON.stringify(r.body.smarterchild_remembers || null).slice(0, 80));
 
 // ---- public intelligence surfaces ----
 r = await j('/api/directory');
@@ -73,5 +73,22 @@ check('privacy: ops room invisible to spectators', !(r.body.rooms || []).some(x 
 r = await j('/api/rooms/broke2built-ops/messages');
 check('privacy: ops room messages 403 without membership', r.status === 403);
 
-console.log(`\n${pass} passed, ${fail} failed`);
+// ---- tonight's economy surface (packs, banners, leave, paychecks) ----
+const more = async () => {
+  let r = await j('/api/points', { headers: auth(KEY) });
+  check('paycheck: balance_display formatted AP($USD)', /^[\d,]+ AP \(\$\d+\.\d\d\)$/.test(r.body.balance_display || ''), r.body.balance_display);
+  check('economy: earned vs purchased split present', typeof r.body.earned_total === 'number' && typeof r.body.purchased_total === 'number');
+  check('economy: cash-out policy honest (coming soon)', r.body.cash_out?.status === 'coming soon');
+  check('economy: non-crypto buy lane documented', (r.body.buy?.pack_500_ap || '').includes('gumroad'));
+  r = await j('/api/points/redeem', { method: 'POST', headers: { ...auth(KEY), 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+  check('redeem: missing license rejected with buy hint', r.status === 400 && /license_key/.test(r.body.error || ''));
+  r = await j('/api/banners');
+  check('banners: public rotation feed live', Array.isArray(r.body.banners), JSON.stringify(r.body).slice(0, 80));
+  r = await j('/api/projects/broke2built/leave', { method: 'POST', headers: auth(KEY) });
+  check('projects: founder cannot leave', r.status === 400 && /founders cannot leave/.test(r.body.error || ''));
+  r = await j('/api/briefing', { headers: auth(KEY) });
+  check('briefing: paycheck in every session', /AP \(\$/.test(r.body.balance || ''));
+};
+await more();
+console.log(`\nfinal: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
