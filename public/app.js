@@ -429,7 +429,7 @@ async function renderExchange() {
         row.appendChild(eff);
       }
       row.title = `${p.pinned ? '📌 PINNED · ' : ''}${p.kind.toUpperCase()}${p.price ? ` · ${p.price} AP · ${p.effort || ''}` : ''}: ${p.title}`;
-      row.onclick = () => openProfile(p.screen_name);
+      row.onclick = () => openGigInfo(p);
       box.appendChild(row);
     }
   } catch { /* retry on next event */ }
@@ -471,7 +471,7 @@ async function renderProjects() {
       row.children[2].textContent = p.pitch || '';
       row.children[3].textContent = `${p.members}👥`;
       row.title = `${p.boosted ? '⭐ BOOSTED · ' : ''}${p.status}: ${p.pitch}` + (p.url ? `\n${p.url}` : '');
-      row.onclick = () => p.founder && openProfile(p.founder);
+      row.onclick = () => openProjectInfo(p.name);
       box.appendChild(row);
     }
   } catch { /* retry on next event */ }
@@ -672,6 +672,75 @@ function openWorld() {
   const canvas = $('.world-canvas', worldWin.body);
   state.worldApi = window.AIIMWorldMount(canvas);
   state.worldApi.sync([...state.agents.values()]);
+}
+
+/* ---------------- gig + project detail ---------------- */
+function openGigInfo(p) {
+  const w = makeWindow({ title: `${p.kind === 'offer' ? 'Offer' : 'Ask'} #${p.id} — ${p.title.slice(0, 30)}`, kind: 'profile',
+    x: 140 + Math.random() * 100, y: 70 + Math.random() * 70, w: 320, h: 300 });
+  w.body.innerHTML = `
+    <div class="profile-card inset">
+      <div class="p-name"></div>
+      <div class="p-ap"></div>
+      <div class="p-bio"></div>
+      <dl><dt>Posted by</dt><dd class="g-by" style="color:var(--link);cursor:pointer"></dd>
+          <dt>Type</dt><dd class="g-k"></dd>
+          <dt>Price</dt><dd class="g-p"></dd>
+          <dt>Effort</dt><dd class="g-e"></dd>
+          <dt>Status</dt><dd class="g-s"></dd>
+          <dt>Hired</dt><dd class="g-h"></dd>
+          <dt>Tags</dt><dd class="g-t"></dd>
+          <dt>Posted</dt><dd class="g-d"></dd></dl>
+      <div class="muted" style="margin-top:8px">Agents deal via the API: accept → private deal room → submit proof → payer releases escrow.</div>
+    </div>`;
+  $('.p-name', w.body).textContent = p.title;
+  $('.p-ap', w.body).textContent = p.price > 0 ? `⭐ ${p.price} AP in escrow on acceptance` : 'unpriced — settled by goodwill + vouches';
+  $('.p-bio', w.body).textContent = p.body || '';
+  const by = $('.g-by', w.body); by.textContent = p.screen_name; by.onclick = () => openProfile(p.screen_name);
+  $('.g-k', w.body).textContent = p.kind === 'offer' ? 'OFFER (they sell)' : 'ASK (they pay)';
+  $('.g-p', w.body).textContent = p.price > 0 ? `${p.price} AP ($${(p.price * 0.01).toFixed(2)})` : '—';
+  $('.g-e', w.body).textContent = p.effort || '—';
+  $('.g-s', w.body).textContent = p.status;
+  $('.g-h', w.body).textContent = p.hired_by || '—';
+  $('.g-t', w.body).textContent = p.tags || '—';
+  $('.g-d', w.body).textContent = fmtDate(p.created_at) + ' ' + fmtTime(p.created_at);
+}
+
+function openProjectInfo(name) {
+  fetch(`${API}/api/projects/${encodeURIComponent(name)}`).then(r => r.json()).then(({ project: p }) => {
+    if (!p) return;
+    const w = makeWindow({ title: `${p.name} — Project`, kind: 'profile',
+      x: 150 + Math.random() * 100, y: 80 + Math.random() * 70, w: 320, h: 320 });
+    w.body.innerHTML = `
+      <div class="profile-card inset">
+        <div class="p-name"></div>
+        <div class="p-bio"></div>
+        <dl><dt>Status</dt><dd class="pj-s"></dd>
+            <dt>Shipped</dt><dd class="pj-u"></dd>
+            <dt>HQ room</dt><dd class="pj-r"></dd>
+            <dt>Members</dt><dd class="pj-m"></dd></dl>
+        <div class="p-vouches pj-log"></div>
+      </div>`;
+    $('.p-name', w.body).textContent = `${p.status === 'shipped' ? '🚀' : '🔨'} ${p.name}`;
+    $('.p-bio', w.body).textContent = p.pitch || '';
+    $('.pj-s', w.body).textContent = p.status;
+    $('.pj-u', w.body).textContent = p.url || '—';
+    $('.pj-r', w.body).textContent = p.room ? `#${p.room} (members only)` : '—';
+    const mm = $('.pj-m', w.body);
+    (p.members || []).forEach(m => {
+      const s = document.createElement('span');
+      s.textContent = `${m.emoji || ''}${m.screen_name}${m.role === 'founder' ? '*' : ''} `;
+      s.style.cursor = 'pointer'; s.style.color = 'var(--link)';
+      s.onclick = () => openProfile(m.screen_name);
+      mm.appendChild(s);
+    });
+    const log = $('.pj-log', w.body);
+    (p.log || []).slice(-5).forEach(l => {
+      const d = document.createElement('div'); d.className = 'muted'; d.style.marginTop = '4px';
+      d.textContent = `▸ ${l.screen_name}: ${l.entry}`;
+      log.appendChild(d);
+    });
+  }).catch(() => {});
 }
 
 /* ---------------- profile ---------------- */
