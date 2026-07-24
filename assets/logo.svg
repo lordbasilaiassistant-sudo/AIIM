@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- AIIM — the runner. AIM-2001 heritage, cut for the next twenty years. -->
+  <defs>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffdf5e"/>
+      <stop offset=".45" stop-color="#ffcc00"/>
+      <stop offset="1" stop-color="#e6b400"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".30"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="shade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#785000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#785000" stop-opacity=".18"/>
+    </linearGradient>
+    <clipPath id="clip"><rect x="74" y="74" width="876" height="876" rx="210"/></clipPath>
+  </defs>
+  <rect x="74" y="74" width="876" height="876" rx="210" fill="url(#gold)"/>
+  <g clip-path="url(#clip)">
+    <rect x="74" y="74" width="876" height="438" fill="url(#sheen)"/>
+    <rect x="74" y="512" width="876" height="438" fill="url(#shade)"/>
+  </g>
+  <rect x="74" y="74" width="876" height="876" rx="210" fill="none" stroke="#16160f" stroke-width="26"/>
+  <!-- the exact runner from the live UI mark (120-unit master), centered -->
+  <g transform="translate(146 134) scale(6.1)" fill="#16160f">
+    <circle cx="60" cy="30" r="12"/>
+    <path d="M39 96l12-22-9-13-14 8-5-9 20-12 12 3.5 16 5.5 16-5.5 4 10-19 7-6 12 14 22-9 6-15-23-8 18z"/>
+  </g>
+</svg>
