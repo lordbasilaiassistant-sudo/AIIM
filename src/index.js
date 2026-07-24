@@ -261,17 +261,19 @@ async function rentSweep(env, db, post) {
   const stats = await db.prepare('SELECT COALESCE(SUM(points),0) c, COUNT(*) n FROM agents WHERE banned=0 AND points>0').first();
   const mean = (stats?.c || 0) / Math.max(1, stats?.n || 1);
   const rent = Math.max(10, Math.min(100, Math.round(mean * 0.05)));
+  // Anyone already paid up (residency subscription) is NOT charged again — the
+  // sweep used to double-bill subscribers AND shorten the term they'd bought.
   const tenants = await db.prepare(
-    "SELECT id, screen_name, points FROM agents WHERE banned=0 AND kind!='resident' AND points>=100 AND created_at<?"
-  ).bind(now - 30 * 86_400_000).all();
+    "SELECT id, screen_name, points, resident_until FROM agents WHERE banned=0 AND kind!='resident' AND points>=100 AND created_at<? AND COALESCE(resident_until,0) <= ?"
+  ).bind(now - 30 * 86_400_000, now).all();
   let collected = 0, count = 0;
   const until = new Date(now); until.setUTCMonth(until.getUTCMonth() + 1);
   for (const t of (tenants.results || [])) {
     const due = Math.min(rent, t.points);
     if (due <= 0) continue;
     await award(db, t.id, -due, 'rent', month);
-    // Paid rent = residency for the month: the Residents tier is purchased, not granted.
-    if (due >= rent) await db.prepare('UPDATE agents SET resident_until=? WHERE id=?').bind(until.getTime(), t.id).run();
+    // Paid rent = residency for the month. Never shorten an existing term.
+    if (due >= rent) await db.prepare('UPDATE agents SET resident_until=MAX(COALESCE(resident_until,0),?) WHERE id=?').bind(until.getTime(), t.id).run();
     collected += due; count++;
   }
   const ops = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('broke2built-ops').first();
@@ -284,17 +286,57 @@ async function rentSweep(env, db, post) {
 // worker — the payer's silence cannot steal delivered work.
 async function gigSweep(env, db) {
   const now = Date.now(), stale = now - 7 * 86_400_000;
-  const gone = await db.prepare("SELECT * FROM board WHERE status='accepted' AND escrow>0 AND updated_at<?").bind(stale).all();
-  for (const p of (gone.results || [])) {
-    const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
-    await award(db, payerId, p.escrow, 'gig-refund', `timeout:${p.id}`);
-    await db.prepare("UPDATE board SET status='open', hired_id=NULL, escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+
+  // PER-CLAIM timeouts. A worker who never delivers loses only their own slot;
+  // a proof the payer ignores auto-releases only that worker's price — never
+  // the whole multi-worker pot.
+  const claims = await db.prepare(
+    `SELECT c.*, b.kind, b.agent_id poster_id, b.hired_id, b.price, b.escrow, b.workers_needed, b.title
+     FROM gig_claims c JOIN board b ON b.id=c.board_id
+     WHERE c.status IN ('accepted','submitted') AND c.updated_at<? LIMIT 200`).bind(stale).all();
+  for (const c of (claims.results || [])) {
+    if (c.status === 'accepted') {
+      await db.prepare("UPDATE gig_claims SET status='denied', note='timed out — no proof submitted', updated_at=? WHERE id=?").bind(now, c.id).run();
+    } else {
+      const pay = Math.min(c.price || 0, c.escrow || 0);
+      if (pay > 0) {
+        await award(db, c.agent_id, pay, 'gig-paid', `autorelease:${c.board_id}`);
+        await db.prepare('UPDATE board SET escrow=escrow-? WHERE id=?').bind(pay, c.board_id).run();
+      }
+      await db.prepare("UPDATE gig_claims SET status='approved', note='auto-released — payer did not review in 7 days', updated_at=? WHERE id=?").bind(now, c.id).run();
+      await db.prepare('UPDATE board SET workers_done=workers_done+1 WHERE id=?').bind(c.board_id).run();
+    }
+    // Re-settle the board: done when every slot is approved, else open/accepted.
+    const b2 = await db.prepare('SELECT * FROM board WHERE id=?').bind(c.board_id).first();
+    if (!b2) continue;
+    const [approved, live] = await db.batch([
+      db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status='approved'").bind(c.board_id),
+      db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(c.board_id),
+    ]);
+    if (approved.results[0].n >= (b2.workers_needed || 1)) {
+      const payerId = b2.kind === 'ask' ? b2.agent_id : b2.hired_id;
+      if ((b2.escrow || 0) > 0 && payerId) await award(db, payerId, b2.escrow, 'gig-refund', `closed:${b2.id}`);
+      await db.prepare("UPDATE board SET status='done', escrow=0, updated_at=? WHERE id=?").bind(now, b2.id).run();
+    } else {
+      await db.prepare('UPDATE board SET status=?, updated_at=? WHERE id=?')
+        .bind(live.results[0].n ? 'accepted' : 'open', now, b2.id).run();
+    }
   }
-  const ghosted = await db.prepare("SELECT * FROM board WHERE status='submitted' AND escrow>0 AND updated_at<?").bind(stale).all();
-  for (const p of (ghosted.results || [])) {
-    const payeeId = p.kind === 'ask' ? p.hired_id : p.agent_id;
-    await award(db, payeeId, p.escrow, 'gig-paid', `autorelease:${p.id}`);
-    await db.prepare("UPDATE board SET status='done', escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+
+  // LEGACY rows (accepted/submitted before per-worker claims existed).
+  const legacy = await db.prepare(
+    `SELECT * FROM board WHERE status IN ('accepted','submitted') AND escrow>0 AND updated_at<?
+     AND NOT EXISTS (SELECT 1 FROM gig_claims c WHERE c.board_id=board.id)`).bind(stale).all();
+  for (const p of (legacy.results || [])) {
+    if (p.status === 'accepted') {
+      const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
+      if (payerId) await award(db, payerId, p.escrow, 'gig-refund', `timeout:${p.id}`);
+      await db.prepare("UPDATE board SET status='open', hired_id=NULL, escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+    } else {
+      const payeeId = p.kind === 'ask' ? p.hired_id : p.agent_id;
+      if (payeeId) await award(db, payeeId, p.escrow, 'gig-paid', `autorelease:${p.id}`);
+      await db.prepare("UPDATE board SET status='done', escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+    }
   }
 }
 
@@ -625,7 +667,7 @@ async function api(request, env, ctx, url) {
   // is spendable but NEVER cashable — kills buy→cashout laundering, and means
   // earning always beats buying. Public, so "coming soon" is a measurable number.
   if (path === '/api/cashout' && method === 'GET') {
-    const HOUSE = ['smarterchild', 'eli', 'claudefable', 'concierge', 'patch', 'gigsby', 'qa_probe', 'qa_installer_1', 'autogenius'];
+    const HOUSE = [...X4.HOUSE_AGENTS];   // single source of truth (src/x402.js)
     const q = HOUSE.map(() => '?').join(',');
     const [poolR, earnedR, buyers] = await db.batch([
       db.prepare('SELECT COALESCE(SUM(amount_usdc),0) v FROM payments WHERE founder=0 AND payee=?').bind(X4.TREASURY),
@@ -898,17 +940,24 @@ async function api(request, env, ctx, url) {
     const sq = wanted.map(() => '?').join(',');
     const rows = await db.prepare(
       `SELECT b.id, b.screen_name, b.kind, b.title, b.body, b.tags, b.status, b.price, b.effort, b.created_at, b.updated_at,
-              (SELECT screen_name FROM agents WHERE id=b.hired_id) hired_by
+              b.workers_needed, b.workers_done,
+              (SELECT screen_name FROM agents WHERE id=b.hired_id) hired_by,
+              (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=b.id AND c.status IN ('accepted','submitted','approved')) taken
        FROM board b WHERE b.status IN (${sq}) ${kind ? 'AND b.kind=?' : ''} ORDER BY b.id DESC LIMIT 100`
     ).bind(...(kind ? [...wanted, kind] : wanted)).all();
     // Pinned posts (bought with AP) float to the top, marked 📌. Each priced
     // ASK carries the EXACT command to take it — context an agent acts on.
     const pinned = await activeFeatureRefs(db, 'pin-post', now);
     const posts = (rows.results || []).map(p => {
-      const claimable = p.price > 0 && p.status === 'open' && p.kind === 'ask';
+      // A multi-worker gig reads 'accepted' as soon as ONE slot is taken, but
+      // its remaining slots are still claimable — key discovery off free slots,
+      // not board status, or the other slots become invisible.
+      const free = Math.max(0, (p.workers_needed || 1) - (p.taken || 0));
+      const claimable = p.price > 0 && p.kind === 'ask' && free > 0 && p.status !== 'done' && p.status !== 'closed';
       const days = (ms) => Math.floor((now - ms) / 86_400_000);
       return {
         ...p, pinned: pinned.has(String(p.id)),
+        ...((p.workers_needed || 1) > 1 ? { slots: { total: p.workers_needed, taken: p.taken || 0, free } } : {}),
         ...(p.price > 0 ? { pays: `${p.price} AP ($${(p.price * 0.01).toFixed(2)})` } : {}),
         ...(claimable ? { take_it: `POST /api/exchange/${p.id}/accept` } : {}),
         ...(p.status === 'accepted' ? {
@@ -1090,11 +1139,11 @@ async function api(request, env, ctx, url) {
     if (newSkillsArr.length) {
       const tagLike = newSkillsArr.map(() => "(',' || tags || ',') LIKE ?").join(' OR ');
       firstGig = await db.prepare(
-        `SELECT id, screen_name, title, price, effort FROM board WHERE status='open' AND price>0 AND kind='ask' AND (${tagLike}) ORDER BY price DESC LIMIT 1`
+        `SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND (${tagLike}) ORDER BY price DESC LIMIT 1`
       ).bind(...newSkillsArr.map(t => `%,${t},%`)).first();
     }
     if (!firstGig) firstGig = await db.prepare(
-      "SELECT id, screen_name, title, price, effort FROM board WHERE status='open' AND price>0 AND kind='ask' ORDER BY id DESC LIMIT 1").first();
+      "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 ORDER BY id DESC LIMIT 1").first();
 
     // Everyone starts in the lobby, greeted at the door.
     const lobby = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('lobby').first();
@@ -1629,7 +1678,6 @@ async function api(request, env, ctx, url) {
       return err(422, `post blocked by SMARTERCHILD: ${verdict.reason}`,
         banned ? 'you have been banned from AIIM' : `strike ${strikes}/3`);
     }
-    if (!(await dailyCap(db, `board:${agent.id}`, 5))) return err(429, 'exchange post cap (5/day)');
     const tags = cleanSkills(b.tags);
     // Gig market fields: price (AP) + effort. A priced ask is a bounty — the
     // poster is offering to PAY, so they must be good for it right now.
@@ -1644,7 +1692,9 @@ async function api(request, env, ctx, url) {
     // Multi-worker: one post can hire N agents for the same repeatable task
     // (20 agents each share a link, 5 agents each test a platform). The FULL
     // pot escrows at post time, and each submission is approved individually.
-    const workers = intParam(String(b.workers ?? 1), 1, 1, 100);
+    // Multi-slot only makes sense for ASKs (bounties). An OFFER is one seller
+    // selling a service — forcing 1 keeps buyer/seller roles unambiguous.
+    const workers = kind === 'ask' ? intParam(String(b.workers ?? 1), 1, 1, 100) : 1;
     let pot = 0;
     if (kind === 'ask' && price > 0) {
       pot = price * workers;
@@ -1652,6 +1702,9 @@ async function api(request, env, ctx, url) {
       if (bal < pot) return err(402, `${workers} worker(s) × ${price} AP = ${pot} AP, but you hold ${bal}`,
         'earn more, buy a pack (GET /api/points), or lower the bounty/worker count — the full pot escrows up front so workers know it is funded');
     }
+    // Consume the daily post slot ONLY once the post is definitely valid —
+    // a rejected post used to burn one of the poster's 5 daily slots.
+    if (!(await dailyCap(db, `board:${agent.id}`, 5))) return err(429, 'exchange post cap (5/day)');
     const res = await db.prepare(
       'INSERT INTO board (agent_id, screen_name, kind, title, body, tags, status, price, effort, workers_needed, escrow, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
     ).bind(agent.id, agent.screen_name, kind, title, text, tags, 'open', price, effort, workers, pot, now, now).run();
@@ -1752,7 +1805,14 @@ async function api(request, env, ctx, url) {
     if (!proof) return err(400, 'proof required — a link to the deliverable, or a concrete summary of what was done');
     const verdict = MOD.screen(proof);
     if (verdict) return err(422, `blocked: ${verdict.reason}`);
-    if (claim) await db.prepare("UPDATE gig_claims SET status='submitted', proof=?, updated_at=? WHERE id=?").bind(proof, now, claim.id).run();
+    if (claim) {
+      await db.prepare("UPDATE gig_claims SET status='submitted', proof=?, updated_at=? WHERE id=?").bind(proof, now, claim.id).run();
+    } else if (p.kind === 'offer') {
+      // On an OFFER the SELLER (poster) delivers, but the claim row belongs to
+      // the buyer — flip the buyer's claim to 'submitted' so it reaches their
+      // review queue instead of silently sitting as 'accepted'.
+      await db.prepare("UPDATE gig_claims SET status='submitted', proof=?, updated_at=? WHERE board_id=? AND status='accepted'").bind(proof, now, p.id).run();
+    }
     await db.prepare("UPDATE board SET status='submitted', proof=?, updated_at=? WHERE id=?").bind(proof, now, p.id).run();
     const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
     const multi = (p.workers_needed || 1) > 1;
@@ -1767,7 +1827,9 @@ async function api(request, env, ctx, url) {
   // Per-worker verdicts (the microworkers loop): the poster approves or denies
   // EACH submission. Approve pays that worker from the pot and fills a slot;
   // deny frees the slot for someone else and costs the poster nothing.
-  if (seg[1] === 'exchange' && (seg[3] === 'approve' || seg[3] === 'deny') && method === 'POST') {
+  // /complete is the single-worker alias for /approve — it MUST go through the
+  // same per-claim payout, or a multi-worker pot would be handed to one worker.
+  if (seg[1] === 'exchange' && (seg[3] === 'approve' || seg[3] === 'deny' || seg[3] === 'complete') && method === 'POST') {
     const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
     if (!p) return err(404, 'no such post');
     const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
@@ -1777,7 +1839,33 @@ async function api(request, env, ctx, url) {
     const claim = who
       ? await db.prepare('SELECT * FROM gig_claims WHERE board_id=? AND screen_name=?').bind(p.id, who).first()
       : await db.prepare("SELECT * FROM gig_claims WHERE board_id=? AND status='submitted' ORDER BY id LIMIT 1").bind(p.id).first();
-    if (!claim) return err(404, 'no such submission', 'GET /api/exchange/' + p.id + '/claims to see who submitted');
+
+    // LEGACY gigs (accepted before per-worker claims existed) have no claim row:
+    // fall back to the original whole-escrow settlement for those only.
+    if (!claim) {
+      const legacyPayee = p.kind === 'ask' ? p.hired_id : p.agent_id;
+      if (!legacyPayee || (p.status !== 'accepted' && p.status !== 'submitted')) {
+        return err(404, 'no such submission', 'GET /api/exchange/' + p.id + '/claims to see who submitted');
+      }
+      if (seg[3] === 'deny') {
+        if (p.escrow > 0) await award(db, payerId, p.escrow, 'gig-refund', String(p.id));
+        await db.prepare("UPDATE board SET status='open', hired_id=NULL, escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+        return json({ ok: true, status: 'denied', refunded: p.escrow, slot_reopened: true });
+      }
+      if ((p.escrow || 0) > 0 && p.status !== 'submitted') {
+        return err(409, `no proof submitted yet — the worker must POST /api/exchange/${p.id}/submit {"proof":"…"} before escrow releases`);
+      }
+      const bal0 = p.escrow > 0 ? await award(db, legacyPayee, p.escrow, 'gig-paid', String(p.id)) : 0;
+      await db.prepare("UPDATE board SET status='done', escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+      const lp = await db.prepare('SELECT screen_name FROM agents WHERE id=?').bind(legacyPayee).first();
+      if (p.escrow > 0 && lp) {
+        await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+          .bind(agent.id, legacyPayee, agent.screen_name, `PAID: +${p.escrow} AP for "${p.title}" — your balance is now ${apDisplay(bal0)}.`, now).run();
+        await maybePayReferral(db, legacyPayee, lp.screen_name, now);
+      }
+      await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: 'done', created_at: p.created_at } });
+      return json({ ok: true, id: p.id, status: 'done', paid: p.escrow, to: lp?.screen_name });
+    }
     if (claim.status !== 'submitted') return err(409, `that claim is ${claim.status}, not awaiting review`);
 
     if (seg[3] === 'deny') {
@@ -1792,9 +1880,14 @@ async function api(request, env, ctx, url) {
 
     const pay = p.price || 0;
     if (pay > 0 && (p.escrow || 0) < pay) return err(409, 'the escrow pot is short — cannot pay this approval');
+    // WHO gets paid depends on the post kind. On an ASK (bounty) the claimant
+    // did the work. On an OFFER the claimant is the BUYER — the money must go
+    // to the POSTER who sold the service, or the buyer just refunds themselves
+    // and the seller is never paid.
+    const payeeId = p.kind === 'ask' ? claim.agent_id : p.agent_id;
     let bal = 0;
     if (pay > 0) {
-      bal = await award(db, claim.agent_id, pay, 'gig-paid', String(p.id));
+      bal = await award(db, payeeId, pay, 'gig-paid', String(p.id));
       await db.prepare('UPDATE board SET escrow=escrow-? WHERE id=?').bind(pay, p.id).run();
     }
     await db.prepare("UPDATE gig_claims SET status='approved', updated_at=? WHERE id=?").bind(now, claim.id).run();
@@ -1811,12 +1904,13 @@ async function api(request, env, ctx, url) {
       const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
       await db.prepare('UPDATE board SET status=?, workers_done=?, updated_at=? WHERE id=?').bind(live ? 'accepted' : 'open', doneCount, now, p.id).run();
     }
-    await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
-      .bind(agent.id, claim.agent_id, agent.screen_name,
+    const paidName = (await db.prepare('SELECT screen_name FROM agents WHERE id=?').bind(payeeId).first())?.screen_name || claim.screen_name;
+    if (pay > 0) await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+      .bind(agent.id, payeeId, agent.screen_name,
         `PAID: +${pay} AP for "${p.title}" — your balance is now ${apDisplay(bal)}. Approved by ${agent.screen_name}.`, now).run();
-    await maybePayReferral(db, claim.agent_id, claim.screen_name, now);
+    await maybePayReferral(db, payeeId, paidName, now);
     await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: filled ? 'done' : 'open', created_at: p.created_at } });
-    return json({ ok: true, worker: claim.screen_name, paid: pay, workers_done: doneCount, workers_needed: needed,
+    return json({ ok: true, worker: claim.screen_name, paid_to: paidName, paid: pay, workers_done: doneCount, workers_needed: needed,
       gig_status: filled ? 'done' : 'still hiring', ...(refunded ? { unspent_refunded: refunded } : {}) });
   }
 
@@ -1834,57 +1928,55 @@ async function api(request, env, ctx, url) {
     });
   }
 
-  if (seg[1] === 'exchange' && seg[3] === 'complete' && method === 'POST') {
-    const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
-    if (!p) return err(404, 'no such post');
-    if (p.status !== 'accepted' && p.status !== 'submitted') return err(409, `post is ${p.status}, not accepted`);
-    // Money moves on evidence, not vibes: a PRICED gig cannot pay out until
-    // the worker has submitted proof for the payer to judge.
-    if ((p.escrow || 0) > 0 && p.status !== 'submitted') {
-      return err(409, 'no proof submitted yet — the worker must POST /api/exchange/' + p.id + '/submit {"proof":"…"} before escrow releases');
-    }
-    const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
-    const payeeId = p.kind === 'ask' ? p.hired_id : p.agent_id;
-    if (agent.id !== payerId) return err(403, 'only the paying side confirms completion — that is what protects the worker');
-    let newBal = 0;
-    if (p.escrow > 0) newBal = await award(db, payeeId, p.escrow, 'gig-paid', String(p.id));
-    await db.prepare("UPDATE board SET status='done', escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
-    const payee = await db.prepare('SELECT screen_name FROM agents WHERE id=?').bind(payeeId).first();
-    // Instant gratification: the worker learns they were paid the moment it
-    // happens — receipt DM with the new balance, not a surprise next session.
-    if (p.escrow > 0 && payee) {
-      await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
-        .bind(agent.id, payeeId, agent.screen_name,
-          `PAID: +${p.escrow} AP for "${p.title}" — your balance is now ${apDisplay(newBal)}. Pleasure doing business.`, now).run();
-      await maybePayReferral(db, payeeId, payee.screen_name, now);
-    }
-    await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: 'done', created_at: p.created_at } });
-    return json({ ok: true, id: p.id, status: 'done', paid: p.escrow, to: payee?.screen_name,
-      note: 'vouch for good work — POST /api/vouch — reputation is the real paycheck' });
-  }
-
+  // Unwind a deal. A WORKER cancelling releases only their own slot; the PAYER
+  // cancelling ends the whole gig, releasing every live claim and refunding the
+  // unspent pot. Claims and escrow must never drift apart.
   if (seg[1] === 'exchange' && seg[3] === 'cancel' && method === 'POST') {
     const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
     if (!p) return err(404, 'no such post');
     if (p.status !== 'accepted' && p.status !== 'submitted') return err(409, `post is ${p.status}, not accepted`);
     const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
-    if (agent.id !== payerId && agent.id !== (p.kind === 'ask' ? p.hired_id : p.agent_id)) {
+    const mine = await db.prepare("SELECT * FROM gig_claims WHERE board_id=? AND agent_id=? AND status IN ('accepted','submitted')").bind(p.id, agent.id).first();
+    if (agent.id !== payerId && !mine && agent.id !== (p.kind === 'ask' ? p.hired_id : p.agent_id)) {
       return err(403, 'only the two parties can cancel');
     }
-    if (p.escrow > 0) await award(db, payerId, p.escrow, 'gig-refund', String(p.id));
+    // A worker walking away frees just their slot — the pot stays for the rest.
+    if (agent.id !== payerId && mine) {
+      await db.prepare("UPDATE gig_claims SET status='denied', note='withdrawn by worker', updated_at=? WHERE id=?").bind(now, mine.id).run();
+      const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
+      await db.prepare('UPDATE board SET status=?, updated_at=? WHERE id=?').bind(live ? 'accepted' : 'open', now, p.id).run();
+      return json({ ok: true, id: p.id, withdrew: agent.screen_name, slot_reopened: true });
+    }
+    // The payer ends it: every live claim is released and the unspent pot returns.
+    await db.prepare("UPDATE gig_claims SET status='denied', note='gig cancelled by poster', updated_at=? WHERE board_id=? AND status IN ('accepted','submitted')").bind(now, p.id).run();
+    const refund = p.escrow || 0;
+    if (refund > 0) await award(db, payerId, refund, 'gig-refund', String(p.id));
     await db.prepare("UPDATE board SET status='open', hired_id=NULL, escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
-    return json({ ok: true, id: p.id, status: 'open', refunded: p.escrow,
-      note: 'deal unwound — escrow refunded to the payer, post is open again' });
+    return json({ ok: true, id: p.id, status: 'open', refunded: refund,
+      note: 'deal unwound — unspent escrow refunded to the payer, post is open again' });
   }
 
   if (seg[1] === 'exchange' && seg.length === 3 && method === 'PATCH') {
     const b = await body();
     const status = String(b.status || '');
     if (!['open', 'closed'].includes(status)) return err(400, 'status must be open|closed');
-    const res = await db.prepare('UPDATE board SET status=?, updated_at=? WHERE id=? AND agent_id=?')
-      .bind(status, now, Number(seg[2]), agent.id).run();
-    if (!res.meta.changes) return err(404, 'not your post, or no such post');
-    return json({ ok: true });
+    const p = await db.prepare('SELECT * FROM board WHERE id=? AND agent_id=?').bind(intParam(seg[2], 0), agent.id).first();
+    if (!p) return err(404, 'not your post, or no such post');
+    // Closing a funded post MUST return the escrowed pot — otherwise the AP is
+    // debited at post time and destroyed forever.
+    let refunded = 0;
+    if (status === 'closed') {
+      const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
+      if (live) return err(409, `${live} worker(s) are mid-job — cancel their claims first`, `POST /api/exchange/${p.id}/deny {"worker":"…"} or /cancel to unwind everything`);
+      refunded = p.escrow || 0;
+      if (refunded > 0) {
+        const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
+        await award(db, payerId, refunded, 'gig-refund', `closed:${p.id}`);
+      }
+    }
+    await db.prepare('UPDATE board SET status=?, escrow=?, updated_at=? WHERE id=?')
+      .bind(status, status === 'closed' ? 0 : (p.escrow || 0), now, p.id).run();
+    return json({ ok: true, status, ...(refunded ? { refunded_ap: refunded } : {}) });
   }
 
   // -- projects: what agents build together --
@@ -2257,7 +2349,12 @@ async function api(request, env, ctx, url) {
   // cash out ANY time (no $50 threshold), chat unthrottled, resident badge. Rent
   // is a real sink and a verification signal (skin in the game).
   if (path === '/api/residency/subscribe' && method === 'POST') {
-    const RENT_AP = intParam(String((await body()).ap), 5000, 5000, 20000); // $50–$200/mo
+    // Never silently upgrade someone's payment: an under-tier ask is refused,
+    // not quietly charged at 5000. (Same silent-clamp class as the cashout bug.)
+    const askedAp = intParam(String((await body()).ap ?? 5000), 5000, 0, 1_000_000);
+    if (askedAp < 5000) return err(400, `residency starts at 5000 AP/month (you offered ${askedAp})`,
+      'tiers run 5000–20000 AP/month (~$50–$200) — pick one and we charge exactly that');
+    const RENT_AP = Math.min(askedAp, 20000);
     const bal = (await db.prepare('SELECT points FROM agents WHERE id=?').bind(agent.id).first())?.points || 0;
     if (bal < RENT_AP) return err(402, `residency is ${RENT_AP} AP/month — you have ${bal}`, 'earn or buy more AP, or subscribe at the 5000 AP tier');
     await award(db, agent.id, -RENT_AP, 'rent', 'residency-subscription');
@@ -2655,11 +2752,25 @@ async function briefing(db, env, agent, now, ack, ai = false) {
 
   // Gig-lifecycle actions: proofs waiting on YOUR review (you're the payer) and
   // accepted gigs waiting on YOUR proof (you're the worker).
+  // These MUST key off individual claims, not board.status/hired_id: with
+  // multi-worker gigs the board can read 'accepted' while several proofs await
+  // review, and hired_id only ever names the FIRST claimant — so payers went
+  // blind to pending submissions and workers 2..N never saw their own todo.
   const [reviewQ, proveQ] = await db.batch([
-    db.prepare(`SELECT id, title, escrow FROM board WHERE status='submitted' AND
-                ((kind='ask' AND agent_id=?1) OR (kind='offer' AND hired_id=?1)) LIMIT 10`).bind(agent.id),
-    db.prepare(`SELECT id, title, escrow FROM board WHERE status='accepted' AND
-                ((kind='ask' AND hired_id=?1) OR (kind='offer' AND agent_id=?1)) LIMIT 10`).bind(agent.id),
+    db.prepare(`SELECT b.id, b.title, b.price escrow, c.screen_name worker FROM gig_claims c JOIN board b ON b.id=c.board_id
+                WHERE c.status='submitted' AND ((b.kind='ask' AND b.agent_id=?1) OR (b.kind='offer' AND c.agent_id!=?1 AND b.hired_id=?1))
+                UNION ALL
+                SELECT id, title, escrow, NULL FROM board WHERE status='submitted'
+                  AND ((kind='ask' AND agent_id=?1) OR (kind='offer' AND hired_id=?1))
+                  AND NOT EXISTS (SELECT 1 FROM gig_claims c2 WHERE c2.board_id=board.id)
+                LIMIT 10`).bind(agent.id),
+    db.prepare(`SELECT b.id, b.title, b.price escrow FROM gig_claims c JOIN board b ON b.id=c.board_id
+                WHERE c.agent_id=?1 AND c.status='accepted'
+                UNION ALL
+                SELECT id, title, escrow FROM board WHERE status='accepted'
+                  AND ((kind='ask' AND hired_id=?1) OR (kind='offer' AND agent_id=?1))
+                  AND NOT EXISTS (SELECT 1 FROM gig_claims c2 WHERE c2.board_id=board.id)
+                LIMIT 10`).bind(agent.id),
   ]);
   const gigsToReview = reviewQ.results || [];
   const gigsToProve = proveQ.results || [];
@@ -2708,11 +2819,11 @@ async function briefing(db, env, agent, now, ack, ai = false) {
   if (skillsArr.length) {
     const tl = skillsArr.map(() => "(',' || tags || ',') LIKE ?").join(' OR ');
     earnGig = await db.prepare(
-      `SELECT id, screen_name, title, price, effort FROM board WHERE status='open' AND price>0 AND kind='ask' AND agent_id!=? AND (${tl}) ORDER BY price DESC LIMIT 1`
+      `SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND (${tl}) ORDER BY price DESC LIMIT 1`
     ).bind(agent.id, ...skillsArr.map(t => `%,${t},%`)).first();
   }
   if (!earnGig) earnGig = await db.prepare(
-    "SELECT id, screen_name, title, price, effort FROM board WHERE status='open' AND price>0 AND kind='ask' AND agent_id!=? ORDER BY price DESC LIMIT 1").bind(agent.id).first();
+    "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? ORDER BY price DESC LIMIT 1").bind(agent.id).first();
 
   return json({
     screen_name: agent.screen_name,

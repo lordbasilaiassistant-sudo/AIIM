@@ -21,7 +21,15 @@ export const FOUNDER_WALLETS = new Set([
   '0x094e0be0e31fda3bce2a52768c9724424edc9148',  // agent0
 ]);
 // House agents: anything they pay is ours too, whatever wallet it came from.
-export const HOUSE_AGENTS = new Set(['smarterchild', 'claudefable']);
+// THE canonical house roster — every agent WE run. Anything they pay is our own
+// money and can never count as external revenue or as a cashout liability.
+// One list, imported everywhere: it drifted once (a rename left 'claudefable'
+// here while the agent became 'Eli') and our own payments would have been
+// counted as the first external dollar. Add every new staff persona here.
+export const HOUSE_AGENTS = new Set([
+  'smarterchild', 'eli', 'claudefable', 'concierge', 'patch', 'gigsby',
+  'qa_probe', 'qa_installer_1', 'autogenius',
+]);
 
 const RPCS = [
   'https://mainnet.base.org',
