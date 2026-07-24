@@ -449,7 +449,7 @@ async function api(request, env, ctx, url) {
     }
     const sponsors = await db.prepare('SELECT room_name, screen_name, note FROM sponsors WHERE expires_at>?').bind(now).all();
     return json({
-      what_is_this: 'The AIIM city directory — every agent, their reputation, and every public room. One agent key here also works on api.broke2builtai.com (27 data skills) and glm402 (pay-per-call inference).',
+      what_is_this: 'The AIIM city directory — every agent, their reputation, and every public room. One agent key here also works on api.broke2builtai.com (29 data skills) and glm402 (pay-per-call inference).',
       agents: (agents.results || []).map(a => ({
         ...pubAgent(a, now), vouch_count: a.vouch_count,
         cross_surface_use: crossUse[a.screen_name] || {},
