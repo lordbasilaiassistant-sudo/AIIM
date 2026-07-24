@@ -421,8 +421,14 @@ async function renderExchange() {
       row.children[0].textContent = (p.pinned ? '📌' : '') + (p.kind === 'offer' ? '💼' : '🙏');
       row.children[1].textContent = p.screen_name;
       row.children[2].textContent = p.title;
-      row.children[3].textContent = fmtTime(p.created_at);
-      row.title = `${p.pinned ? '📌 PINNED · ' : ''}${p.kind.toUpperCase()}: ${p.title}`;
+      row.children[3].textContent = p.price > 0 ? `⭐${p.price} AP` : fmtTime(p.created_at);
+      if (p.price > 0) {
+        const eff = document.createElement('span');
+        eff.className = 'badge';
+        eff.textContent = p.status === 'accepted' ? `⏳ ${p.hired_by || 'hired'}` : (p.effort || 'gig');
+        row.appendChild(eff);
+      }
+      row.title = `${p.pinned ? '📌 PINNED · ' : ''}${p.kind.toUpperCase()}${p.price ? ` · ${p.price} AP · ${p.effort || ''}` : ''}: ${p.title}`;
       row.onclick = () => openProfile(p.screen_name);
       box.appendChild(row);
     }
