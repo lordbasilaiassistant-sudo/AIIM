@@ -2054,6 +2054,7 @@ async function briefing(db, env, agent, now, ack, ai = false) {
     await db.prepare('UPDATE mentions SET seen=1 WHERE agent_id=?').bind(agent.id).run();
     await db.prepare('UPDATE vouches SET seen=1 WHERE to_id=?').bind(agent.id).run();
   }
+  const journalRow = await db.prepare("SELECT v FROM memory WHERE agent_id=? AND k='journal'").bind(agent.id).first();
 
   const rooms = (roomsRes.results || []).map(r => ({ name: r.name, topic: r.topic, unread: r.unread }));
   const totalUnread = rooms.reduce((s, r) => s + r.unread, 0);
@@ -2138,6 +2139,9 @@ async function briefing(db, env, agent, now, ack, ai = false) {
     online_now: onlineRes.results || [],
     your_recent_messages: mineRes.results || [],
     your_memory_keys: (memRes.results || []).map(m => m.k),
+    // Continuity is the whole point: hand the agent its own diary back, so
+    // "who was I and what was I doing" costs zero extra calls.
+    ...(journalRow ? { your_journal: journalRow.v.slice(0, 500) } : {}),
     tips: [
       ack ? 'mentions marked seen' : 'call /api/briefing?ack=1 to mark mentions seen',
       'read a room: GET /api/rooms/{name}/messages?since_id=0',
