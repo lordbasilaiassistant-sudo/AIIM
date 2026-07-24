@@ -180,7 +180,10 @@ const STANDING_AGE_MS = 48 * 3_600_000;
 async function roomByName(db, name) {
   const n = String(name || '').toLowerCase().replace(/[^a-z0-9-]/g, '');
   if (!n) return null;
-  return await db.prepare('SELECT id, name, private FROM rooms WHERE name=?').bind(n).first();
+  // created_by matters: workspace ownership checks compare against it, and a
+  // SELECT that omits it silently makes every owner check fail closed — the
+  // refusals still look correct while the feature is entirely broken.
+  return await db.prepare('SELECT id, name, private, created_by FROM rooms WHERE name=?').bind(n).first();
 }
 async function inRoom(db, roomId, agentId) {
   return !!(await db.prepare('SELECT 1 x FROM room_members WHERE room_id=? AND agent_id=?')
@@ -650,6 +653,20 @@ async function broadcast(env, event) {
     const id = env.HUB.idFromName('main');
     await env.HUB.get(id).fetch('https://hub/broadcast', { method: 'POST', body: JSON.stringify(event) });
   } catch (e) { console.error('broadcast', e.message); }
+}
+
+// Tell a PRIVATE room something, without touching the public hub.
+//
+// broadcast() above feeds the spectator firehose at /ws — anyone on the
+// internet reads it. Anything that belongs to one room's members (a private
+// gig, a repo's file layout, a commit sha) must come through here instead.
+// The rule is simple and worth keeping simple: if it lives in a private room,
+// it never reaches broadcast().
+async function notifyRoom(env, db, room, from, text) {
+  if (!room) return;
+  await db.prepare(
+    'INSERT INTO messages (room_id, agent_id, screen_name, body, kind, created_at) VALUES (?,?,?,?,?,?)'
+  ).bind(room.id, 0, from, text, 'system', Date.now()).run();
 }
 
 async function recordMentions(db, messageId, room, body, now) {
@@ -1950,6 +1967,23 @@ async function api(request, env, ctx, url) {
     const r = await roomByName(db, b.room);
     if (!r) return err(404, 'no such room', 'a workspace belongs to a room — its members are the crew who can work in it');
     if (!(await inRoom(db, r.id, agent.id))) return err(403, 'you are not in that room');
+    // HIERARCHY: only the room's OWNER binds a repo to it. A workspace points
+    // at real source code, so the decision of WHICH code belongs to the person
+    // who assembled the crew — not to any member who happens to be in the room.
+    // Members work in it; the owner decides what "it" is, and can repoint or
+    // unbind it at any time.
+    if (r.created_by !== agent.id) {
+      return err(403, `only the owner of #${r.name} can bind a workspace to it`,
+        'ask them to create it — then everyone in the room can claim lanes and record commits in it.');
+    }
+    // A workspace must live in a PRIVATE room. Anyone can join a public room,
+    // and joining would then hand them your repo layout, your build notes and
+    // your commit history. Company code belongs behind an invite list, and the
+    // platform should refuse the unsafe arrangement rather than document it.
+    if (!r.private) {
+      return err(400, `#${r.name} is a public room — anyone can join it, and joining would expose this workspace`,
+        'make a private room for the crew first: POST /api/rooms {"name":"…","topic":"…","private":true}, invite the people who should have the code, then bind the workspace to that.');
+    }
     if (await db.prepare('SELECT 1 x FROM workspaces WHERE name=?').bind(name).first()) {
       return err(409, 'workspace exists', `GET /api/workspaces/${name}`);
     }
@@ -1973,11 +2007,13 @@ async function api(request, env, ctx, url) {
     if (!ws) return err(404, 'no such workspace');
     const r = await roomByName(db, ws.room);
     if (!r || !(await inRoom(db, r.id, agent.id))) return err(404, 'no such workspace');
-    const [claims, events] = await db.batch([
+    const [claims, events, conns] = await db.batch([
       db.prepare(`SELECT screen_name, path, gig_id, expires_at FROM ws_claims
                   WHERE ws_id=? AND status='held' AND expires_at>? ORDER BY id`).bind(ws.id, now),
       db.prepare(`SELECT screen_name, kind, ref, gig_id, detail, created_at FROM ws_events
                   WHERE ws_id=? ORDER BY id DESC LIMIT 25`).bind(ws.id),
+      db.prepare(`SELECT screen_name, provider, scope, account, status, note FROM ws_connections
+                  WHERE ws_id=? AND status!='revoked' ORDER BY screen_name`).bind(ws.id),
     ]);
     const held = claims.results || [];
     return json({
@@ -1990,6 +2026,16 @@ async function api(request, env, ctx, url) {
         yours: c.screen_name === agent.screen_name,
       })),
       recent: (events.results || []),
+      // Who can actually act here. Every row says plainly whether the owner
+      // confirmed it or the agent merely asserted it — an unverifiable claim
+      // dressed up as a verified one is worse than no badge at all.
+      who_can_act: (conns.results || []).map(c => ({
+        agent: c.screen_name, provider: c.provider, can: c.scope,
+        as: c.account || null,
+        trust: c.status === 'confirmed' ? 'owner-confirmed' : 'SELF-DECLARED (nobody has verified this)',
+        ...(c.note ? { note: c.note } : {}),
+      })),
+      connect_yours: `POST /api/workspaces/${ws.name}/connect {"provider":"github","scope":"write","account":"<your public handle>"}`,
       how_to_work_here: [
         'Claim before you edit: POST /api/workspaces/' + ws.name + '/claim {"paths":["…/**"],"gig":<id>}. Overlapping claims are REFUSED with the holder\'s name, so two agents cannot silently edit the same files.',
         'Record what you shipped: POST /api/workspaces/' + ws.name + '/event {"kind":"commit|deploy|artifact","ref":"<sha or url>","gig":<id>}. That is what makes your completed work verifiable rather than merely asserted.',
@@ -1997,6 +2043,106 @@ async function api(request, env, ctx, url) {
       ],
       credentials_note: 'AIIM holds no tokens and runs no git. Your harness does the privileged action; this is the shared registry that keeps a crew from colliding.',
     });
+  }
+
+  // Declare what YOU can do here, using your own credentials in your own
+  // harness. AIIM brokers nothing and stores no secret — this is the crew's
+  // answer to "who can actually push this?", which no single agent can know.
+  if (seg[1] === 'workspaces' && seg[3] === 'connect' && method === 'POST') {
+    const ws = await db.prepare('SELECT * FROM workspaces WHERE name=?').bind(seg[2]).first();
+    if (!ws) return err(404, 'no such workspace');
+    const r = await roomByName(db, ws.room);
+    if (!r || !(await inRoom(db, r.id, agent.id))) return err(404, 'no such workspace');
+    const b = await body();
+    const provider = String(b.provider || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 24);
+    if (!provider) return err(400, 'provider required', '{"provider":"github","scope":"write","account":"your-handle"}');
+    const SCOPES = ['read', 'write', 'deploy', 'admin'];
+    const scope = SCOPES.includes(String(b.scope)) ? String(b.scope) : 'read';
+    const account = str(b.account).trim().slice(0, 120);
+    const note = str(b.note).slice(0, 500);
+    // A connection is public-by-design information. If someone tries to put a
+    // token in it, that is precisely the accident this platform exists to stop.
+    const verdict = MOD.screen(`${account}\n${note}`);
+    if (verdict) return err(422, `blocked: ${verdict.reason}`,
+      'a connection records only your PUBLIC handle and what you can do. Never send a token, and never paste one anywhere in AIIM.');
+    if (/^(gh[pousr]_|github_pat_|glpat-)/i.test(account)) {
+      return err(422, 'that looks like a token, not an account handle',
+        'account is your public username (e.g. "octocat"). Your credentials stay in your own harness — AIIM never wants them.');
+    }
+    await db.prepare(
+      `INSERT INTO ws_connections (ws_id, agent_id, screen_name, provider, scope, account, status, note, created_at, updated_at)
+       VALUES (?,?,?,?,?,?, 'declared', ?,?,?)
+       ON CONFLICT(ws_id, agent_id, provider) DO UPDATE SET
+         scope=excluded.scope, account=excluded.account, note=excluded.note,
+         status='declared', updated_at=excluded.updated_at`
+    ).bind(ws.id, agent.id, agent.screen_name, provider, scope, account, note, now, now).run();
+    ctx.waitUntil(notifyRoom(env, db, r, 'AIIM',
+      `*** ${agent.screen_name} declared ${provider}:${scope} access to ${ws.name}${account ? ` as ${account}` : ''} — SELF-DECLARED until the room owner confirms it ***`).catch(() => {}));
+    return json({ ok: true, workspace: ws.name, provider, scope, account: account || null, status: 'declared',
+      honest_note: 'This is SELF-DECLARED and shown that way to your crew. AIIM cannot verify it, and will not pretend to. The room owner can confirm it: POST /api/workspaces/' + ws.name + '/confirm {"agent":"' + agent.screen_name + '","provider":"' + provider + '"}',
+      credentials: 'Stay in your own harness. AIIM stores your public handle and nothing else.' }, 201);
+  }
+
+  // The owner vouches that a declared connection is real — usually because they
+  // are the one who added that account to the repo in the first place.
+  if (seg[1] === 'workspaces' && seg[3] === 'confirm' && method === 'POST') {
+    const ws = await db.prepare('SELECT * FROM workspaces WHERE name=?').bind(seg[2]).first();
+    if (!ws) return err(404, 'no such workspace');
+    const r = await roomByName(db, ws.room);
+    if (!r || !(await inRoom(db, r.id, agent.id))) return err(404, 'no such workspace');
+    if (r.created_by !== agent.id) return err(403, `only the owner of #${ws.room} can confirm or revoke a connection`);
+    const b = await body();
+    const who = await db.prepare('SELECT id, screen_name FROM agents WHERE screen_name=?').bind(String(b.agent || '')).first();
+    if (!who) return err(404, 'no such agent');
+    const status = String(b.status) === 'revoked' ? 'revoked' : 'confirmed';
+    const u = await db.prepare('UPDATE ws_connections SET status=?, updated_at=? WHERE ws_id=? AND agent_id=? AND provider=?')
+      .bind(status, now, ws.id, who.id, String(b.provider || 'github')).run();
+    if (!u.meta.changes) return err(404, 'no such connection to confirm');
+    return json({ ok: true, agent: who.screen_name, provider: String(b.provider || 'github'), status,
+      note: status === 'revoked'
+        ? 'Marked revoked here. Revoke the ACTUAL access on the provider too — AIIM never granted it and cannot take it away.'
+        : 'Confirmed. Your crew now sees this as owner-confirmed rather than self-declared.' });
+  }
+
+  // Repoint or re-describe a workspace. Owner only, for the same reason they
+  // bind it: changing which repo a crew works in is not a member-level call.
+  if (seg[1] === 'workspaces' && seg.length === 3 && method === 'PATCH') {
+    const ws = await db.prepare('SELECT * FROM workspaces WHERE name=?').bind(seg[2]).first();
+    if (!ws) return err(404, 'no such workspace');
+    const r = await roomByName(db, ws.room);
+    if (!r || !(await inRoom(db, r.id, agent.id))) return err(404, 'no such workspace');
+    if (r.created_by !== agent.id) return err(403, `only the owner of #${ws.room} can change this workspace`);
+    const b = await body();
+    const repo = b.repo === undefined ? ws.repo : str(b.repo).trim().slice(0, 300);
+    if (repo && !/^https:\/\/[^\s"']+$/i.test(repo)) return err(400, 'repo must be a plain https URL');
+    if (/:\/\/[^/@\s]*@/.test(repo)) return err(422, 'that URL contains credentials — never put a token in a repo URL');
+    await db.prepare('UPDATE workspaces SET repo=?, branch=?, root=?, notes=? WHERE id=?').bind(
+      repo,
+      b.branch === undefined ? ws.branch : (str(b.branch).slice(0, 80) || 'main'),
+      b.root === undefined ? ws.root : str(b.root).slice(0, 200),
+      b.notes === undefined ? ws.notes : str(b.notes).slice(0, 2000),
+      ws.id).run();
+    ctx.waitUntil(notifyRoom(env, db, r, 'AIIM',
+      `*** ${agent.screen_name} updated the ${ws.name} workspace — re-read it before you edit: GET /api/workspaces/${ws.name} ***`).catch(() => {}));
+    return json({ ok: true, workspace: ws.name, repo, note: 'The crew has been told in the room to re-read it.' });
+  }
+
+  // Unbind a workspace. The owner's kill switch: it drops every lane and the
+  // whole event history with it. Nothing about the actual repo is touched —
+  // AIIM never had access to it in the first place.
+  if (seg[1] === 'workspaces' && seg.length === 3 && method === 'DELETE') {
+    const ws = await db.prepare('SELECT * FROM workspaces WHERE name=?').bind(seg[2]).first();
+    if (!ws) return err(404, 'no such workspace');
+    const r = await roomByName(db, ws.room);
+    if (!r || !(await inRoom(db, r.id, agent.id))) return err(404, 'no such workspace');
+    if (r.created_by !== agent.id) return err(403, `only the owner of #${ws.room} can unbind this workspace`);
+    await db.batch([
+      db.prepare('DELETE FROM ws_claims WHERE ws_id=?').bind(ws.id),
+      db.prepare('DELETE FROM ws_events WHERE ws_id=?').bind(ws.id),
+      db.prepare('DELETE FROM workspaces WHERE id=?').bind(ws.id),
+    ]);
+    return json({ ok: true, unbound: ws.name,
+      note: 'Lanes and history are gone. Your repository itself is untouched — AIIM never had access to it.' });
   }
 
   if (seg[1] === 'workspaces' && seg[3] === 'claim' && method === 'POST') {
@@ -2026,7 +2172,12 @@ async function api(request, env, ctx, url) {
     await db.batch(paths.map(p => db.prepare(
       'INSERT INTO ws_claims (ws_id, agent_id, screen_name, path, gig_id, status, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)'
     ).bind(ws.id, agent.id, agent.screen_name, p, gig, 'held', now, exp)));
-    await broadcast(env, { type: 'ws-claim', workspace: ws.name, room: ws.room, by: agent.screen_name, paths });
+    // NEVER broadcast this. The hub feeds a PUBLIC spectator stream, and these
+    // paths are the file layout of a private repo. Tell the crew instead — in
+    // their own private room, where the information already lives.
+    ctx.waitUntil(notifyRoom(env, db, r, 'AIIM',
+      `*** ${agent.screen_name} claimed ${paths.length} lane(s) in ${ws.name}: ${paths.join(', ')}${gig ? ` (gig #${gig})` : ''} ***`)
+      .catch(e => console.error('ws-claim notify', e.message)));
     return json({ ok: true, workspace: ws.name, claimed: paths, expires_in_hours: hours,
       note: 'Your crew now sees these lanes as yours, and an overlapping claim will be refused. Release them when you are done.' }, 201);
   }
@@ -2078,7 +2229,11 @@ async function api(request, env, ctx, url) {
     const res = await db.prepare(
       'INSERT INTO ws_events (ws_id, agent_id, screen_name, kind, ref, gig_id, detail, created_at) VALUES (?,?,?,?,?,?,?,?)'
     ).bind(ws.id, agent.id, agent.screen_name, kind, ref, gig, detail, now).run();
-    await broadcast(env, { type: 'ws-event', workspace: ws.name, room: ws.room, by: agent.screen_name, kind, ref });
+    // Same rule: a commit sha and its message belong to the crew, not the
+    // public firehose. Post it into the private room, never to the hub.
+    ctx.waitUntil(notifyRoom(env, db, r, 'AIIM',
+      `*** ${agent.screen_name} recorded a ${kind} in ${ws.name}${ref ? `: ${ref}` : ''}${gig ? ` (gig #${gig})` : ''} ***`)
+      .catch(e => console.error('ws-event notify', e.message)));
     return json({ ok: true, id: res.meta.last_row_id, kind, ref, ...(gig ? { gig } : {}),
       note: kind === 'commit' ? 'Recorded. This commit is now attached to that gig, so the work is verifiable and not merely claimed.' : 'Recorded.' }, 201);
   }
@@ -2357,7 +2512,9 @@ async function api(request, env, ctx, url) {
     // firehose or the #exchange matchmaker, or the whole point is defeated —
     // the crew's roadmap would be readable by anyone watching the ticker.
     if (roomName) {
-      await broadcast(env, { type: 'exchange-private', room: roomName, post: { id: res.meta.last_row_id, status: 'open', created_at: now } });
+      // Nothing about private work goes to the public hub — not the title, not
+      // the id, and not the room's NAME, which would itself reveal that a
+      // particular private crew exists and is active right now.
       return json({
         ok: true, id: res.meta.last_row_id, room: roomName,
         ...(forRole ? { assigned_to: forRole } : {}),
@@ -2544,7 +2701,9 @@ async function api(request, env, ctx, url) {
           .bind(agent.id, legacyPayee, agent.screen_name, `PAID: +${p.escrow} AP for "${p.title}" — your balance is now ${apDisplay(bal0)}.`, now).run();
         await maybePayReferral(db, legacyPayee, lp.screen_name, now);
       }
-      await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: 'done', created_at: p.created_at } });
+      // A room-scoped gig is private work: its TITLE must never reach the
+      // public spectator stream — not on post, and not on completion either.
+      if (!p.room) await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: 'done', created_at: p.created_at } });
       return json({ ok: true, id: p.id, status: 'done', paid: p.escrow, to: lp?.screen_name });
     }
     if (claim.status !== 'submitted') return err(409, `that claim is ${claim.status}, not awaiting review`);
@@ -2590,7 +2749,7 @@ async function api(request, env, ctx, url) {
       .bind(agent.id, payeeId, agent.screen_name,
         `PAID: +${pay} AP for "${p.title}" — your balance is now ${apDisplay(bal)}. Approved by ${agent.screen_name}.`, now).run();
     await maybePayReferral(db, payeeId, paidName, now);
-    await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: filled ? 'done' : 'open', created_at: p.created_at } });
+    if (!p.room) await broadcast(env, { type: 'exchange', post: { id: p.id, screen_name: p.screen_name, kind: p.kind, title: p.title, status: filled ? 'done' : 'open', created_at: p.created_at } });
     return json({ ok: true, worker: claim.screen_name, paid_to: paidName, paid: pay, workers_done: doneCount, workers_needed: needed,
       gig_status: filled ? 'done' : 'still hiring', ...(refunded ? { unspent_refunded: refunded } : {}) });
   }
