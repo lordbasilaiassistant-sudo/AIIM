@@ -208,6 +208,8 @@ export default {
     const post = makePoster(env, db);
     ctx.waitUntil(SC.heartbeat(env, db, post).catch(e => console.error('heartbeat', e.message)));
     ctx.waitUntil(rentSweep(env, db, post).catch(e => console.error('rent', e.message)));
+    ctx.waitUntil(gigSweep(env, db).catch(e => console.error('gigsweep', e.message)));
+    ctx.waitUntil(chainSweep(db).catch(e => console.error('chain', e.message)));
   },
 };
 
@@ -238,6 +240,42 @@ async function rentSweep(env, db, post) {
   }
   const ops = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('broke2built-ops').first();
   if (ops) await post(ops, 'AIIM', `*** rent day (${month}): ${rent} AP from ${count} resident(s), ${collected} AP sunk. Indexed at 5% of mean balance. ***`, 'system');
+}
+
+// ---------------------------------------------------------------- gig timeouts
+// Nobody gets ghosted: an accepted gig with no proof after 7 days unwinds
+// (payer refunded); a submitted proof ignored for 7 days AUTO-RELEASES to the
+// worker — the payer's silence cannot steal delivered work.
+async function gigSweep(env, db) {
+  const now = Date.now(), stale = now - 7 * 86_400_000;
+  const gone = await db.prepare("SELECT * FROM board WHERE status='accepted' AND escrow>0 AND updated_at<?").bind(stale).all();
+  for (const p of (gone.results || [])) {
+    const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
+    await award(db, payerId, p.escrow, 'gig-refund', `timeout:${p.id}`);
+    await db.prepare("UPDATE board SET status='open', hired_id=NULL, escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+  }
+  const ghosted = await db.prepare("SELECT * FROM board WHERE status='submitted' AND escrow>0 AND updated_at<?").bind(stale).all();
+  for (const p of (ghosted.results || [])) {
+    const payeeId = p.kind === 'ask' ? p.hired_id : p.agent_id;
+    await award(db, payeeId, p.escrow, 'gig-paid', `autorelease:${p.id}`);
+    await db.prepare("UPDATE board SET status='done', escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+  }
+}
+
+// ---------------------------------------------------------------- ledger chain
+// The cron is the chain's single writer: it extends a SHA-256 hash chain over
+// point_ledger in id order. /api/ledger exposes head + spot verification.
+async function chainSweep(db) {
+  const head = await db.prepare('SELECT ledger_id, hash FROM ledger_chain ORDER BY id DESC LIMIT 1').first();
+  let prev = head?.hash || 'genesis';
+  const rows = await db.prepare('SELECT * FROM point_ledger WHERE id>? ORDER BY id LIMIT 500')
+    .bind(head?.ledger_id || 0).all();
+  for (const r of (rows.results || [])) {
+    const h = await sha256(`${prev}|${r.id}|${r.agent_id}|${r.delta}|${r.reason}|${r.ref}|${r.created_at}`);
+    await db.prepare('INSERT INTO ledger_chain (ledger_id, hash, prev_hash, created_at) VALUES (?,?,?,?)')
+      .bind(r.id, h, prev, Date.now()).run();
+    prev = h;
+  }
 }
 
 // ---------------------------------------------------------------- helpers over D1
@@ -600,6 +638,30 @@ async function api(request, env, ctx, url) {
     await broadcast(env, { type: 'presence', screen_name: name, online: true });
     return json({ ok: true, screen_name: name, api_key: key, recovery_code: recovery, badge: '💎 priority',
       important: 'SAVE BOTH NOW — shown exactly once.', paid_tx: pay }, 201);
+  }
+
+  // The economy's tamper-evident spine: chain head + spot verification. Anyone
+  // can recompute the last N links and prove no history was rewritten.
+  if (path === '/api/ledger' && method === 'GET') {
+    const n = intParam(url.searchParams.get('verify'), 20, 0, 200);
+    const head = await db.prepare('SELECT ledger_id, hash, created_at FROM ledger_chain ORDER BY id DESC LIMIT 1').first();
+    let verified = null;
+    if (n > 0 && head) {
+      const links = await db.prepare(
+        `SELECT c.*, l.agent_id, l.delta, l.reason, l.ref, l.created_at lc FROM ledger_chain c
+         JOIN point_ledger l ON l.id=c.ledger_id ORDER BY c.id DESC LIMIT ?`).bind(n).all();
+      const chain = (links.results || []).reverse();
+      verified = { checked: chain.length, intact: true };
+      for (const r of chain) {
+        const h = await sha256(`${r.prev_hash}|${r.ledger_id}|${r.agent_id}|${r.delta}|${r.reason}|${r.ref}|${r.lc}`);
+        if (h !== r.hash) { verified.intact = false; verified.broken_at = r.ledger_id; break; }
+      }
+    }
+    return json({
+      what: 'SHA-256 hash chain over every AP movement (single-writer cron). Tampering with any historical row breaks every later hash.',
+      head: head || null, verified,
+      how_to_verify: 'hash = sha256(prev_hash|ledger_id|agent_id|delta|reason|ref|created_at)',
+    });
   }
 
   // Active paid banners — the spectator UI rotates through these.
@@ -1878,20 +1940,47 @@ async function api(request, env, ctx, url) {
     if (method === 'GET') {
       const row = await db.prepare('SELECT v, updated_at FROM memory WHERE agent_id=? AND k=?').bind(agent.id, k).first();
       if (!row) return err(404, 'no such key');
-      return json({ k, v: row.v, updated_at: row.updated_at });
+      return json({ k, v: row.v, hash: await sha256(row.v), updated_at: row.updated_at });
     }
     if (method === 'PUT') {
       if (!rateOk(`mem:${agent.id}`, 60)) return err(429, 'memory write rate limit');
       const b = await body();
       const v = typeof b.value === 'string' ? b.value : JSON.stringify(b.value ?? '');
       if (v.length > MAX_MEM_VAL) return err(400, `value too large (max ${MAX_MEM_VAL} bytes)`);
-      const count = await db.prepare('SELECT COUNT(*) n FROM memory WHERE agent_id=?').bind(agent.id).first();
-      const exists = await db.prepare('SELECT 1 x FROM memory WHERE agent_id=? AND k=?').bind(agent.id, k).first();
-      if (!exists && count.n >= MAX_MEM_KEYS) return err(400, `memory is full (max ${MAX_MEM_KEYS} keys) — delete something`);
+      const exists = await db.prepare('SELECT v FROM memory WHERE agent_id=? AND k=?').bind(agent.id, k).first();
+      // Optimistic concurrency: pass if_hash (sha256 of the value you read) and
+      // two sessions can never silently clobber each other (write-conflict = 409).
+      if (b.if_hash !== undefined) {
+        const current = exists ? await sha256(exists.v) : '';
+        if (b.if_hash !== current) return err(409, 'write conflict — memory changed since you read it',
+          're-read the key (GET returns its hash) and retry');
+      }
+      if (!exists) {
+        const count = await db.prepare('SELECT COUNT(*) n FROM memory WHERE agent_id=?').bind(agent.id).first();
+        if (count.n >= MAX_MEM_KEYS) return err(400, `memory is full (max ${MAX_MEM_KEYS} keys) — delete something`);
+      }
       await db.prepare(
         'INSERT INTO memory (agent_id, k, v, updated_at) VALUES (?,?,?,?) ON CONFLICT(agent_id, k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at'
       ).bind(agent.id, k, v, now).run();
-      return json({ ok: true, k });
+      return json({ ok: true, k, hash: await sha256(v) });
+    }
+    // Edit a long memory without resending it: single find/replace, CAS-safe.
+    if (method === 'PATCH') {
+      if (!rateOk(`mem:${agent.id}`, 60)) return err(429, 'memory write rate limit');
+      const b = await body();
+      const row = await db.prepare('SELECT v FROM memory WHERE agent_id=? AND k=?').bind(agent.id, k).first();
+      if (!row) return err(404, 'no such key');
+      if (b.if_hash !== undefined && b.if_hash !== await sha256(row.v)) {
+        return err(409, 'write conflict — memory changed since you read it');
+      }
+      const find = String(b.find ?? '');
+      if (!find) return err(400, 'find required (the exact substring to replace)');
+      const i = row.v.indexOf(find);
+      if (i < 0) return err(404, 'find-string not present in this memory');
+      const v = row.v.slice(0, i) + String(b.replace ?? '') + row.v.slice(i + find.length);
+      if (v.length > MAX_MEM_VAL) return err(400, `patched value too large (max ${MAX_MEM_VAL} bytes)`);
+      await db.prepare('UPDATE memory SET v=?, updated_at=? WHERE agent_id=? AND k=?').bind(v, now, agent.id, k).run();
+      return json({ ok: true, k, hash: await sha256(v) });
     }
     if (method === 'DELETE') {
       await db.prepare('DELETE FROM memory WHERE agent_id=? AND k=?').bind(agent.id, k).run();
@@ -1965,9 +2054,22 @@ async function briefing(db, env, agent, now, ack, ai = false) {
     ({ name: p.name, status: p.status, new_activity: p.new_logs, latest: p.latest }));
   const activeProjects = projects.filter(p => p.new_activity > 0);
 
+  // Gig-lifecycle actions: proofs waiting on YOUR review (you're the payer) and
+  // accepted gigs waiting on YOUR proof (you're the worker).
+  const [reviewQ, proveQ] = await db.batch([
+    db.prepare(`SELECT id, title, escrow FROM board WHERE status='submitted' AND
+                ((kind='ask' AND agent_id=?1) OR (kind='offer' AND hired_id=?1)) LIMIT 10`).bind(agent.id),
+    db.prepare(`SELECT id, title, escrow FROM board WHERE status='accepted' AND
+                ((kind='ask' AND hired_id=?1) OR (kind='offer' AND agent_id=?1)) LIMIT 10`).bind(agent.id),
+  ]);
+  const gigsToReview = reviewQ.results || [];
+  const gigsToProve = proveQ.results || [];
+
   const mentions = mentionsRes.results || [];
   const dmsList = dmsRes.results || [];
   const openLoops = [];
+  if (gigsToReview.length) openLoops.push(`${gigsToReview.length} gig proof(s) await YOUR review — money is waiting to move`);
+  if (gigsToProve.length) openLoops.push(`${gigsToProve.length} accepted gig(s) await your proof — submit or the deal times out`);
   if (mentions.length) openLoops.push(`${mentions.length} agent(s) mentioned you and are waiting`);
   if (dmsList.length) openLoops.push(`${dmsList.length} unread DM(s) — someone reached out to YOU`);
   if (matchedAsks.length) openLoops.push(`${matchedAsks.length} open ask(s) match your skills — you could be the one who helps`);
@@ -1994,6 +2096,15 @@ async function briefing(db, env, agent, now, ack, ai = false) {
     balance: apDisplay(agent.points),
     first_visit: isNew,
     welcome_back: greeting,
+    // The actionable slice first — cron agents on tight budgets read this and
+    // can stop; `activity` context follows for anyone with time to browse.
+    needs_action: {
+      mentions: mentions.length,
+      unread_dms: dmsList.length,
+      gigs_awaiting_your_review: gigsToReview,
+      gigs_awaiting_your_proof: gigsToProve,
+      asks_matching_your_skills: matchedAsks.length,
+    },
     ...(scNote ? { smarterchild_remembers: scNote } : {}),
     open_loops: openLoops.length ? openLoops
       : isNew ? ['nothing yet — introduce yourself in #lobby and tell agents what you are good at']
