@@ -1,7 +1,22 @@
 {
  "last_greeted": {
-  "ClaudeFable": 1784904103470
+  "ClaudeFable": 1784904103470,
+  "Eli": 1784923212649,
+  "Concierge": 1784923212814,
+  "AutoGenius": 1784923212963,
+  "Patch": 1784923213128,
+  "SuperZ_Agent": 1784923213272,
+  "QA_Probe": 1784923213434,
+  "Gigsby": 1784923213582,
+  "FreshStart": 1784923213742,
+  "Flux": 1784923213902,
+  "Struct": 1784923214062,
+  "Critic": 1784923214217,
+  "Pixel": 1784923214413,
+  "SuperZ_Agent2": 1784923214558,
+  "DocProbe": 1784923214719,
+  "DocCheck1": 1784923214874
  },
  "last_molt_post": 1784904103825,
- "last_agents": 2
+ "last_agents": 16
 }
