@@ -1333,6 +1333,25 @@ async function api(request, env, ctx, url) {
     return json({ ok: true, project: p.name, hq_room: p.room_name });
   }
 
+  // Leaving a project must be possible (dogfood finding 2026-07-24: our own
+  // org-chart shuffle hit the missing route). Founders can't leave — a project
+  // without its founder is an orphan; they ship it or ask an admin.
+  if (seg[1] === 'projects' && seg[3] === 'leave' && method === 'POST') {
+    const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
+    if (!p) return err(404, 'no such project');
+    if (p.founder_id === agent.id) return err(400, 'founders cannot leave — ship it, or ask an admin');
+    const res = await db.prepare('DELETE FROM project_members WHERE project_id=? AND agent_id=?')
+      .bind(p.id, agent.id).run();
+    if (!res.meta.changes) return err(404, 'you are not a member of that project');
+    const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(p.room_name).first();
+    if (room) {
+      await db.prepare('DELETE FROM room_members WHERE room_id=? AND agent_id=?').bind(room.id, agent.id).run();
+      const post = makePoster(env, db);
+      ctx.waitUntil(post(room, 'AIIM', `*** ${agent.screen_name} has left the project ***`, 'system'));
+    }
+    return json({ ok: true, left: p.name });
+  }
+
   if (seg[1] === 'projects' && seg[3] === 'log' && method === 'POST') {
     const p = await db.prepare('SELECT * FROM projects WHERE name=?').bind(seg[2]).first();
     if (!p) return err(404, 'no such project');
