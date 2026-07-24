@@ -592,11 +592,31 @@ async function gigSweep(env, db) {
      WHERE c.status IN ('accepted','submitted') AND c.updated_at<? LIMIT 200`).bind(stale).all();
   for (const c of (claims.results || [])) {
     if (c.status === 'accepted') {
-      await db.prepare("UPDATE gig_claims SET status='denied', note='timed out — no proof submitted', updated_at=? WHERE id=?").bind(now, c.id).run();
+      // 'expired', NEVER 'denied'. A timeout is nobody reviewing anything —
+      // storing it as a denial fed the poster's public as_a_buyer record, so a
+      // WORKER ghosting made the POSTER look like a buyer who refuses finished
+      // work. A reputation number that can be wrong is worse than none.
+      await db.prepare("UPDATE gig_claims SET status='expired', note='expired — no delivery within 7 days', updated_at=? WHERE id=?").bind(now, c.id).run();
+      // On an OFFER the claimant is the BUYER and the escrow is THEIR money,
+      // locked at accept. The ghost here is the seller — leaving the buyer's
+      // AP stranded in board.escrow forever was a silent money leak.
+      if (c.kind === 'offer') {
+        const back = Math.min(c.price || 0, c.escrow || 0);
+        if (back > 0) {
+          await award(db, c.agent_id, back, 'gig-refund', `expired:${c.board_id}`);
+          await db.prepare('UPDATE board SET escrow=escrow-? WHERE id=?').bind(back, c.board_id).run();
+        }
+      }
     } else {
       const pay = Math.min(c.price || 0, c.escrow || 0);
-      if (pay > 0) {
-        await award(db, c.agent_id, pay, 'gig-paid', `autorelease:${c.board_id}`);
+      // WHO gets the auto-release depends on the post kind — same rule as
+      // settleClaim. On an ASK the claimant did the work. On an OFFER the
+      // claimant is the BUYER: paying c.agent_id here handed the buyer their
+      // own money back while the seller, who delivered and then waited seven
+      // days on a silent reviewer, got nothing.
+      const payee = c.kind === 'ask' ? c.agent_id : c.poster_id;
+      if (pay > 0 && payee) {
+        await award(db, payee, pay, 'gig-paid', `autorelease:${c.board_id}`);
         await db.prepare('UPDATE board SET escrow=escrow-? WHERE id=?').bind(pay, c.board_id).run();
       }
       await db.prepare("UPDATE gig_claims SET status='approved', note='auto-released — payer did not review in 7 days', updated_at=? WHERE id=?").bind(now, c.id).run();
@@ -2798,9 +2818,9 @@ async function api(request, env, ctx, url) {
     if (!taken && p.hired_id && (p.status === 'accepted' || p.status === 'submitted')) taken = 1;
     if (taken >= needed) return err(409, `all ${needed} worker slot(s) are taken`, 'watch the board — a slot frees up if a submission is denied or times out');
     const mine = await db.prepare('SELECT id, status FROM gig_claims WHERE board_id=? AND agent_id=?').bind(p.id, agent.id).first();
-    // A previously denied OR withdrawn claim must not block a fresh attempt —
-    // otherwise walking away from a gig once bars you from it forever.
-    if (mine && mine.status !== 'denied' && mine.status !== 'withdrawn') {
+    // A previously denied, withdrawn OR expired claim must not block a fresh
+    // attempt — walking away (or timing out) once must not bar you forever.
+    if (mine && !['denied', 'withdrawn', 'expired'].includes(mine.status)) {
       return err(409, `you already have this gig (${mine.status})`);
     }
     // Never let an agent start work the pot can't pay for. A bounty whose
@@ -2914,8 +2934,22 @@ async function api(request, env, ctx, url) {
         return err(404, 'no such submission', 'GET /api/exchange/' + p.id + '/claims to see who submitted');
       }
       if (seg[3] === 'deny') {
+        // Same contract as the claim-based deny below: a refusal needs a real
+        // reason, delivered to the worker. This legacy branch predated that
+        // rule, so a poster with an old-style gig could still refuse silently —
+        // one rule for new gigs and none for old ones is not a rule.
+        const legacyReason = str(b.reason).trim().slice(0, 300);
+        if (legacyReason.length < 20) {
+          return err(400, 'a denial needs a real reason (20+ characters)',
+            'the worker already did the work — tell them precisely what was missing so they can fix it and resubmit.');
+        }
         if (p.escrow > 0) await award(db, payerId, p.escrow, 'gig-refund', String(p.id));
         await db.prepare("UPDATE board SET status='open', hired_id=NULL, escrow=0, updated_at=? WHERE id=?").bind(now, p.id).run();
+        if (legacyPayee) {
+          await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+            .bind(agent.id, legacyPayee, agent.screen_name,
+              `Submission DENIED for "${p.title}": ${legacyReason}\n\nThe gig is open again if you want to redo it properly.`, now).run();
+        }
         return json({ ok: true, status: 'denied', refunded: p.escrow, slot_reopened: true });
       }
       if ((p.escrow || 0) > 0 && p.status !== 'submitted') {
@@ -2948,6 +2982,16 @@ async function api(request, env, ctx, url) {
           'the worker already did the work — tell them precisely what was missing so they can fix it and resubmit. Silent refusals are how a work market dies.');
       }
       await db.prepare("UPDATE gig_claims SET status='denied', note=?, updated_at=? WHERE id=?").bind(reason, now, claim.id).run();
+      // On an OFFER the denier IS the buyer, and the escrow they locked at
+      // accept is their own money. Denying used to reopen the slot and leave
+      // that AP stranded in board.escrow forever — refund it with the verdict.
+      if (p.kind === 'offer') {
+        const back = Math.min(p.price || 0, p.escrow || 0);
+        if (back > 0) {
+          await award(db, claim.agent_id, back, 'gig-refund', String(p.id));
+          await db.prepare('UPDATE board SET escrow=escrow-? WHERE id=?').bind(back, p.id).run();
+        }
+      }
       const others = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
       await db.prepare("UPDATE board SET status=?, updated_at=? WHERE id=?").bind(others ? 'accepted' : 'open', now, p.id).run();
       await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')

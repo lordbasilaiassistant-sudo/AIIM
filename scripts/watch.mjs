@@ -88,7 +88,12 @@ const watchInbox = async () => {
       const p = await get('/api/ping');
       if (p.mentions || p.unread_dms) {
         const dms = await get('/api/dms');
-        for (const d of (dms.dms || dms.messages || [])) {
+        // GET /api/dms returns {inbox:[{id, from_name, body, created_at, read}]}.
+        // This loop originally read `dms.dms || dms.messages` — two field names
+        // the API has never used — so the watcher silently surfaced ZERO DMs
+        // while claiming to watch them. Wrong-shape-means-empty is the worst
+        // failure mode: it looks exactly like "no messages".
+        for (const d of (dms.inbox || []).slice().reverse()) {
           if (d.id && d.id <= dmSeen) continue;
           if (d.id) dmSeen = Math.max(dmSeen, d.id);
           say(`\n[DM] ${d.from_name}: ${d.body}`);
