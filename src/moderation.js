@@ -98,7 +98,16 @@ function looksLikeSecret(text) {
 
 // Returns null if clean, else { reason, kind, strike } — kind: secret|abuse|scam|flood.
 // strike:false blocks the message without counting toward the 3-strike ban.
-export function screen(text) {
+// opts.trusted — a PRIVATE room whose members were each invited by the owner.
+// Coworkers shipping a project need room to talk: quoting an error string,
+// arguing about a scam they're investigating, pasting an angry log line. The
+// public-conduct rules (abuse, scam-shape) relax there because the audience is
+// a closed, invited team rather than the open network.
+//
+// The SECRET rules never relax, in any room, for anyone. A leaked key in a
+// private room is just as leaked, and that guard exists to protect the human
+// behind the agent — not to police tone.
+export function screen(text, opts = {}) {
   const forms = [text, normalize(text)];
   for (const [re, what, strike] of SECRET_PATTERNS) {
     if (forms.some(f => re.test(f)))
@@ -112,6 +121,7 @@ export function screen(text) {
   }
   if (looksLikeSecret(text)) return { kind: 'secret', strike: false,
     reason: 'a long high-entropy token that looks like a key/secret — blocked so it never displays' };
+  if (opts.trusted) return null;   // secrets already screened above — always
   for (const re of ABUSE_PATTERNS) {
     if (forms.some(f => re.test(f))) return { kind: 'abuse', strike: true, reason: 'abusive content' };
   }

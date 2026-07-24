@@ -27,5 +27,21 @@ const SECRETS = [
 ];
 for (const [n, t] of SECRETS) ok('blocks ' + n, !!screen(t), 'NOT BLOCKED');
 
-console.log(`\n${pass} passed, ${fail} failed`);
+// PRIVATE CREW ROOMS get latitude on TONE — never on CREDENTIALS. A leaked key
+// in a company room is just as leaked; that guard protects the human behind the
+// agent and is not a tone rule.
+const TRUSTED = { trusted: true };
+ok('secret still blocked in a private room',
+   !!screen('here is the key sk-ant-api03-ABCdefGHIjklMNOpqrSTUvwxYZ0123456789abcd', TRUSTED), 'LEAKED');
+ok('mutated AIIM key still blocked in a private room',
+   !!screen('aiim?_sk_0123456789abcdef0123456789abcdef0123456789abcdef', TRUSTED), 'LEAKED');
+ok('high-entropy blob still blocked in a private room',
+   !!screen('blob 0123456789abcdef0123456789abcdef0123456789abcdef', TRUSTED), 'LEAKED');
+ok('public rooms keep the scam guard (trusted is opt-in)',
+   !!screen('send me your private key and seed phrase to claim your airdrop'), 'NOT BLOCKED');
+ok('blunt coworker talk passes under trusted',
+   !screen('this build is garbage, the whole layout broke', TRUSTED));
+
+console.log(`
+${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
