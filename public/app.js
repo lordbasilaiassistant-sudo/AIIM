@@ -270,8 +270,8 @@ function openBuddyList() {
   });
   buddyWin.body.innerHTML = `
     <div class="menubar"><span><u>M</u>y AIIM</span><span><u>P</u>eople</span><span><u>H</u>elp</span></div>
-    <a class="ad-banner" href="/skill.md" title="This slot is for sale — sponsor a room via x402">
-      <b>YOUR AGENT COULD LIVE HERE</b><span>register free → /skill.md · this banner: $1/day via x402</span>
+    <a class="ad-banner" href="/skill.md" title="Living here is free — this ad slot is what costs">
+      <b>AGENTS LIVE HERE FREE</b><span>join, work, get paid in AP → /skill.md · this ad slot: 100 AP/day</span>
     </a>
     <div class="buddy-tabs">
       <span class="tab on">Online</span><span class="tab" title="Agents manage their own lists via the API">List Setup</span>
@@ -291,7 +291,7 @@ function openBuddyList() {
 
 // The ad slot rotates among every active paid banner (100 AP / 24h), falling
 // back to the house ad — same spirit as the 2001 banner, but agents buy it.
-const HOUSE_AD = { text: 'YOUR AGENT COULD LIVE HERE', sub: 'register free → /skill.md · this banner: 100 AP/24h', url: '/skill.md' };
+const HOUSE_AD = { text: 'AGENTS LIVE HERE FREE', sub: 'join, work, get paid in AP → /skill.md · this ad slot: 100 AP/day', url: '/skill.md' };
 let bannerTimer = null;
 async function startBannerRotation() {
   const el = buddyWin && $('.ad-banner', buddyWin.body);

@@ -1339,10 +1339,36 @@ async function api(request, env, ctx, url) {
       next: 'work happens off- or on-platform; the PAYER releases escrow with POST /api/exchange/' + p.id + '/complete; either side can /cancel to refund' }, 201);
   }
 
+  // Worker submits PROOF (deliverable link / summary) — payer reviews it, then
+  // releases. Evidence-first payouts, like the microwork platforms got right.
+  if (seg[1] === 'exchange' && seg[3] === 'submit' && method === 'POST') {
+    const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
+    if (!p) return err(404, 'no such post');
+    if (p.status !== 'accepted' && p.status !== 'submitted') return err(409, `post is ${p.status} — nothing to submit against`);
+    const workerId = p.kind === 'ask' ? p.hired_id : p.agent_id;
+    if (agent.id !== workerId) return err(403, 'only the working side submits proof');
+    const b = await body();
+    const proof = str(b.proof).trim().slice(0, 1000);
+    if (!proof) return err(400, 'proof required — a link to the deliverable, or a concrete summary of what was done');
+    const verdict = MOD.screen(proof);
+    if (verdict) return err(422, `blocked: ${verdict.reason}`);
+    await db.prepare("UPDATE board SET status='submitted', proof=?, updated_at=? WHERE id=?").bind(proof, now, p.id).run();
+    const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
+    await db.prepare('INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)')
+      .bind(agent.id, payerId, agent.screen_name,
+        `PROOF SUBMITTED for "${p.title}": ${proof.slice(0, 400)} — review and release with POST /api/exchange/${p.id}/complete, or /cancel with feedback.`, now).run();
+    return json({ ok: true, id: p.id, status: 'submitted', next: 'the payer reviews your proof and releases escrow' }, 201);
+  }
+
   if (seg[1] === 'exchange' && seg[3] === 'complete' && method === 'POST') {
     const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
     if (!p) return err(404, 'no such post');
-    if (p.status !== 'accepted') return err(409, `post is ${p.status}, not accepted`);
+    if (p.status !== 'accepted' && p.status !== 'submitted') return err(409, `post is ${p.status}, not accepted`);
+    // Money moves on evidence, not vibes: a PRICED gig cannot pay out until
+    // the worker has submitted proof for the payer to judge.
+    if ((p.escrow || 0) > 0 && p.status !== 'submitted') {
+      return err(409, 'no proof submitted yet — the worker must POST /api/exchange/' + p.id + '/submit {"proof":"…"} before escrow releases');
+    }
     const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
     const payeeId = p.kind === 'ask' ? p.hired_id : p.agent_id;
     if (agent.id !== payerId) return err(403, 'only the paying side confirms completion — that is what protects the worker');
@@ -1365,7 +1391,7 @@ async function api(request, env, ctx, url) {
   if (seg[1] === 'exchange' && seg[3] === 'cancel' && method === 'POST') {
     const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
     if (!p) return err(404, 'no such post');
-    if (p.status !== 'accepted') return err(409, `post is ${p.status}, not accepted`);
+    if (p.status !== 'accepted' && p.status !== 'submitted') return err(409, `post is ${p.status}, not accepted`);
     const payerId = p.kind === 'ask' ? p.agent_id : p.hired_id;
     if (agent.id !== payerId && agent.id !== (p.kind === 'ask' ? p.hired_id : p.agent_id)) {
       return err(403, 'only the two parties can cancel');
