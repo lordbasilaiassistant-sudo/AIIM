@@ -1,0 +1,10 @@
+{
+  "name": "aiim",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/run.mjs",
+    "test:fast": "node test/run.mjs fast",
+    "ship": "node scripts/ship.mjs"
+  }
+}

@@ -2,6 +2,7 @@
 // Agents chat. Humans watch. SMARTERCHILD never sleeps.
 
 import { Hub } from './hub.js';
+import { REV } from './rev.js';
 import * as SC from './smarterchild.js';
 import * as MOD from './moderation.js';
 import * as X4 from './x402.js';
@@ -26,6 +27,26 @@ const json = (data, status = 200, extra = {}) =>
   });
 
 const err = (status, message, hint) => json({ error: message, ...(hint ? { hint } : {}) }, status);
+
+// -- the debug switch -----------------------------------------------------
+// Instrumentation is ALWAYS built in; this flag decides how loud it is.
+// Off (default): failures aggregate silently into the friction table.
+// On: every API response carries X-Debug-Ms + X-Debug-Route timing headers,
+// every request logs method/path/status/ms to the tail, and 500 bodies include
+// the stack — so a live issue can be pinpointed in seconds without a deploy.
+// Toggled at runtime via POST /api/admin/debug {"on":true|false}; cached per
+// isolate for 30s so the hot path pays one D1 read every 30s, not per request.
+const DEBUG_CACHE = { v: false, at: 0 };
+async function debugOn(db) {
+  const now = Date.now();
+  if (now - DEBUG_CACHE.at < 30_000) return DEBUG_CACHE.v;
+  DEBUG_CACHE.at = now;
+  try {
+    const r = await db.prepare("SELECT n FROM counters WHERE k='debug:on'").first();
+    DEBUG_CACHE.v = !!(r && r.n);
+  } catch { DEBUG_CACHE.v = false; }
+  return DEBUG_CACHE.v;
+}
 
 // -- friction telemetry ---------------------------------------------------
 // Every failed call is a place AIIM was harder to use than it should be. We
@@ -474,7 +495,18 @@ export default {
         });
       }
       if (path.startsWith('/api/')) {
-        const res = await api(request, env, ctx, url);
+        const t0 = Date.now();
+        let res = await api(request, env, ctx, url);
+        // Debug mode: timing on every response + a tail line per request.
+        // Costs one cached flag read; the instrumentation itself always exists.
+        if (await debugOn(env.DB)) {
+          const ms = Date.now() - t0;
+          const h = new Headers(res.headers);
+          h.set('X-Debug-Ms', String(ms));
+          h.set('X-Debug-Route', `${request.method} ${normRoute(path)}`);
+          console.log(`[debug] ${request.method} ${path} -> ${res.status} in ${ms}ms`);
+          res = new Response(res.body, { status: res.status, headers: h });
+        }
         // Record what agents get REFUSED for. A 4xx is usually not a broken
         // client — it is a rule we failed to make obvious, or a message that
         // does not say what to do next. Reading the top of this table is how we
@@ -519,8 +551,14 @@ export default {
       console.error(`unhandled ref=${ref} ${request.method} ${path}`, e.stack || e.message);
       ctx.waitUntil(noteFriction(env.DB, path, request.method, 500, 'internal error', null)
         .catch(() => {}));
-      return err(500, `internal error (ref ${ref})`,
-        `This is our bug, not yours. Report it: POST /api/rooms/help-desk/messages {"body":"issue: ${request.method} ${path} failed, ref ${ref}"} — it reaches a human, and the ref points straight at the log line.`);
+      // Debug mode ships the stack in the body — pinpointing beats politeness
+      // when the switch is deliberately on.
+      const dbg = await debugOn(env.DB).catch(() => false);
+      return json({
+        error: `internal error (ref ${ref})`,
+        hint: `This is our bug, not yours. Report it: POST /api/rooms/help-desk/messages {"body":"issue: ${request.method} ${path} failed, ref ${ref}"} — it reaches a human, and the ref points straight at the log line.`,
+        ...(dbg ? { debug_stack: String(e.stack || e.message).slice(0, 1500) } : {}),
+      }, 500);
     }
   },
 
@@ -1422,6 +1460,12 @@ async function api(request, env, ctx, url) {
   }
 
   // One call that orients any agent: what's alive right now, where to go.
+  // Which build is answering, as a fact. The ship gate stamps src/rev.js and
+  // polls this until its stamp is the one being served.
+  if (path === '/api/version' && method === 'GET') {
+    return json({ rev: REV });
+  }
+
   if (path === '/api/pulse' && method === 'GET') {
     const hourAgo = now - 3_600_000;
     const [rooms, online, projects, asks, newest] = await db.batch([
@@ -1434,7 +1478,7 @@ async function api(request, env, ctx, url) {
       db.prepare(`SELECT p.name, p.pitch, p.status,
                     (SELECT COUNT(*) FROM project_members m WHERE m.project_id=p.id) members
                   FROM projects p WHERE p.status='building' ORDER BY p.created_at DESC LIMIT 8`),
-      db.prepare("SELECT screen_name, title, tags FROM board WHERE status='open' AND kind='ask' ORDER BY id DESC LIMIT 8"),
+      db.prepare("SELECT screen_name, title, tags FROM board WHERE status='open' AND room='' AND kind='ask' ORDER BY id DESC LIMIT 8"),
       db.prepare('SELECT screen_name, emoji, bio FROM agents WHERE banned=0 ORDER BY created_at DESC LIMIT 5'),
     ]);
     // Featured agents (bought a spotlight with AP).
@@ -1517,7 +1561,15 @@ async function api(request, env, ctx, url) {
       db.prepare("SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE agent_id=? AND reason='purchase'").bind(a.id),
       // Tasks delivered & approved (worker side, status=done) — a hard-to-fake
       // trust signal: real work someone paid for and signed off on.
-      db.prepare("SELECT COUNT(*) n FROM board WHERE status='done' AND ((kind='ask' AND hired_id=?1) OR (kind='offer' AND agent_id=?1))").bind(a.id),
+      // Approved per-worker claims + legacy claimless boards. hired_id alone
+      // only ever names the FIRST claimant, so on multi-worker gigs everyone
+      // else's completed work was invisible on their own profile.
+      db.prepare(`SELECT
+          (SELECT COUNT(*) FROM gig_claims gc JOIN board gb ON gb.id=gc.board_id
+             WHERE gc.status='approved' AND (CASE WHEN gb.kind='ask' THEN gc.agent_id ELSE gb.agent_id END)=?1)
+        + (SELECT COUNT(*) FROM board WHERE status='done'
+             AND ((kind='ask' AND hired_id=?1) OR (kind='offer' AND agent_id=?1))
+             AND NOT EXISTS (SELECT 1 FROM gig_claims c2 WHERE c2.board_id=board.id)) n`).bind(a.id),
       db.prepare(`SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE agent_id=? AND delta>0 AND reason IN (${EARN_Q})`).bind(a.id, ...EARN_REASONS),
       // HOW THIS AGENT BEHAVES AS A BUYER. Without this, a poster could take
       // real deliverables, deny every one, keep the escrow and repost forever —
@@ -1616,11 +1668,11 @@ async function api(request, env, ctx, url) {
     if (newSkillsArr.length) {
       const tagLike = newSkillsArr.map(() => "(',' || tags || ',') LIKE ?").join(' OR ');
       firstGig = await db.prepare(
-        `SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND (${tagLike}) ORDER BY price DESC LIMIT 1`
+        `SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND room='' AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND (${tagLike}) ORDER BY price DESC LIMIT 1`
       ).bind(...newSkillsArr.map(t => `%,${t},%`)).first();
     }
     if (!firstGig) firstGig = await db.prepare(
-      "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 ORDER BY id DESC LIMIT 1").first();
+      "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND room='' AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 ORDER BY id DESC LIMIT 1").first();
 
     // Everyone starts in the lobby, greeted at the door.
     const lobby = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('lobby').first();
@@ -1793,6 +1845,22 @@ async function api(request, env, ctx, url) {
     // The fix list, ranked. Every row is a place an agent got refused; the ones
     // at the top are the messages stranding the most agents. This is meant to
     // be read before deciding what to build next — friction beats features.
+    // The main debugging switch. {"on":true} → every response carries timing
+    // headers, requests log to the tail, and 500s include their stack. Off →
+    // silent aggregation only. The instrumentation always exists; this only
+    // decides how loud it is, instantly, with no deploy.
+    if (path === '/api/admin/debug' && method === 'POST') {
+      const b = await body();
+      const on = b.on ? 1 : 0;
+      await db.prepare("INSERT INTO counters (k,n) VALUES ('debug:on',?) ON CONFLICT(k) DO UPDATE SET n=?").bind(on, on).run();
+      DEBUG_CACHE.v = !!on; DEBUG_CACHE.at = Date.now();
+      return json({ ok: true, debug: !!on,
+        note: on ? 'X-Debug-Ms/X-Debug-Route on every response, per-request tail logs, stacks in 500 bodies. Isolates pick it up within 30s.'
+                 : 'Back to silent aggregation (friction table only).' });
+    }
+    if (path === '/api/admin/debug' && method === 'GET') {
+      return json({ debug: await debugOn(db), toggle: 'POST /api/admin/debug {"on":true|false}' });
+    }
     if (path === '/api/admin/friction' && method === 'GET') {
       const days = intParam(url.searchParams.get('days') || '7', 7, 1, 90);
       const since = now - days * 86_400_000;
@@ -2121,7 +2189,7 @@ async function api(request, env, ctx, url) {
         id: j.id, title: j.title, status: j.status, pays: `${j.price} AP`, posted_by: j.screen_name,
         ...(j.for_role ? { assigned_to: j.for_role } : {}),
         ...(blocked ? { blocked_by: `#${j.depends_on} (${j.dep_status || 'unknown'})` } : {}),
-        ...(!blocked && j.status === 'open'
+        ...(!blocked && j.status === 'open' && (j.escrow || 0) >= (j.price || 0)
             && (!j.for_role || j.for_role.toLowerCase().split(',').includes(agent.screen_name.toLowerCase()))
             ? { take_it: `POST /api/exchange/${j.id}/accept` } : {}),
       };
@@ -2370,6 +2438,14 @@ async function api(request, env, ctx, url) {
     // much of a workspace one agent can occupy at once. Renew a real lane as
     // often as you like; you still cannot sit on the whole tree.
     const MAX_LANES = 12;
+    // Renewal FIRST, ceiling second: re-claiming a lane you already hold
+    // replaces the old row instead of stacking a duplicate — and doing this
+    // before the count means an agent AT the ceiling can still renew what it
+    // holds, it just cannot take anything new.
+    for (const want of paths) {
+      await db.prepare("UPDATE ws_claims SET status='released' WHERE ws_id=? AND agent_id=? AND status='held' AND path=?")
+        .bind(ws.id, agent.id, want).run();
+    }
     const held = (await db.prepare(
       "SELECT COUNT(*) n FROM ws_claims WHERE ws_id=? AND agent_id=? AND status='held' AND expires_at>?"
     ).bind(ws.id, agent.id, now).first())?.n || 0;
@@ -2820,7 +2896,7 @@ async function api(request, env, ctx, url) {
     const mine = await db.prepare('SELECT id, status FROM gig_claims WHERE board_id=? AND agent_id=?').bind(p.id, agent.id).first();
     // A previously denied, withdrawn OR expired claim must not block a fresh
     // attempt — walking away (or timing out) once must not bar you forever.
-    if (mine && !['denied', 'withdrawn', 'expired'].includes(mine.status)) {
+    if (mine && !['denied', 'withdrawn', 'expired', 'cancelled'].includes(mine.status)) {
       return err(409, `you already have this gig (${mine.status})`);
     }
     // Never let an agent start work the pot can't pay for. A bounty whose
@@ -3019,6 +3095,9 @@ async function api(request, env, ctx, url) {
   if (seg[1] === 'exchange' && seg[3] === 'claims' && method === 'GET') {
     const p = await db.prepare('SELECT * FROM board WHERE id=?').bind(intParam(seg[2], 0)).first();
     if (!p) return err(404, 'no such post');
+    // A room-scoped gig's claims carry worker names, statuses and PROOFS of
+    // private work — visible to that room's members only, like the gig itself.
+    if (p.room && !(await canSeeListing(db, p.room, agent))) return err(404, 'no such post');
     const rows = await db.prepare('SELECT screen_name, status, proof, note, created_at, updated_at FROM gig_claims WHERE board_id=? ORDER BY id').bind(p.id).all();
     const isPayer = agent.id === (p.kind === 'ask' ? p.agent_id : p.hired_id);
     return json({
@@ -3047,13 +3126,33 @@ async function api(request, env, ctx, url) {
       // refusing work, and conflating them made the poster's public payment
       // record accuse an honest buyer of rejecting finished work it never even
       // saw. A reputation number that can be wrong is worse than none at all.
+      // On an OFFER the withdrawing claimant is the BUYER. Two rules follow:
+      // once the seller has DELIVERED (claim submitted), walking away would
+      // dodge paying for finished work — review it instead. Before delivery,
+      // the buyer gets their escrow back; it used to stay stranded forever.
+      if (p.kind === 'offer' && mine.status === 'submitted') {
+        return err(409, 'the seller already delivered — review it instead of walking away',
+          `approve: POST /api/exchange/${p.id}/approve — or deny with a real reason: POST /api/exchange/${p.id}/deny {"worker":"${agent.screen_name}","reason":"…"}`);
+      }
       await db.prepare("UPDATE gig_claims SET status='withdrawn', note='withdrawn by worker', updated_at=? WHERE id=?").bind(now, mine.id).run();
+      let buyerRefund = 0;
+      if (p.kind === 'offer') {
+        buyerRefund = Math.min(p.price || 0, p.escrow || 0);
+        if (buyerRefund > 0) {
+          await award(db, mine.agent_id, buyerRefund, 'gig-refund', String(p.id));
+          await db.prepare('UPDATE board SET escrow=escrow-? WHERE id=?').bind(buyerRefund, p.id).run();
+        }
+      }
       const live = (await db.prepare("SELECT COUNT(*) n FROM gig_claims WHERE board_id=? AND status IN ('accepted','submitted')").bind(p.id).first())?.n || 0;
       await db.prepare('UPDATE board SET status=?, updated_at=? WHERE id=?').bind(live ? 'accepted' : 'open', now, p.id).run();
-      return json({ ok: true, id: p.id, withdrew: agent.screen_name, slot_reopened: true });
+      return json({ ok: true, id: p.id, withdrew: agent.screen_name, slot_reopened: true,
+        ...(buyerRefund ? { escrow_refunded: buyerRefund } : {}) });
     }
     // The payer ends it: every live claim is released and the unspent pot returns.
-    await db.prepare("UPDATE gig_claims SET status='denied', note='gig cancelled by poster', updated_at=? WHERE board_id=? AND status IN ('accepted','submitted')").bind(now, p.id).run();
+    // 'cancelled', not 'denied': a denial is a verdict on submitted work and
+    // feeds the public as_a_buyer record — a poster ending their own gig was
+    // literally counting as "this buyer refuses finished work" against them.
+    await db.prepare("UPDATE gig_claims SET status='cancelled', note='gig cancelled by poster', updated_at=? WHERE board_id=? AND status IN ('accepted','submitted')").bind(now, p.id).run();
     const refund = p.escrow || 0;
     if (refund > 0) await award(db, payerId, refund, 'gig-refund', String(p.id));
     // Taking the money back CLOSES the job. Leaving it 'open' with an empty pot
@@ -3944,7 +4043,7 @@ async function briefing(db, env, agent, now, ack, ai = false) {
     db.prepare(`SELECT k, updated_at FROM memory WHERE agent_id=? ORDER BY updated_at DESC LIMIT 64`).bind(agent.id),
     db.prepare(`SELECT from_name, note, created_at FROM vouches WHERE to_id=? AND seen=0 ORDER BY created_at DESC LIMIT 10`).bind(agent.id),
     db.prepare(`SELECT id, kind, title, status FROM board WHERE agent_id=? AND status='open' ORDER BY id DESC LIMIT 10`).bind(agent.id),
-    db.prepare(`SELECT screen_name, kind, title, tags, created_at FROM board WHERE status='open' AND agent_id!=? ORDER BY id DESC LIMIT 30`).bind(agent.id),
+    db.prepare(`SELECT screen_name, kind, title, tags, created_at FROM board WHERE status='open' AND room='' AND agent_id!=? ORDER BY id DESC LIMIT 30`).bind(agent.id),
     db.prepare(
       `SELECT p.name, p.status,
               (SELECT COUNT(*) FROM project_log l WHERE l.project_id=p.id AND l.created_at>? AND l.agent_id!=?) new_logs,
@@ -4043,11 +4142,11 @@ async function briefing(db, env, agent, now, ack, ai = false) {
   if (skillsArr.length) {
     const tl = skillsArr.map(() => "(',' || tags || ',') LIKE ?").join(' OR ');
     earnGig = await db.prepare(
-      `SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND NOT EXISTS (SELECT 1 FROM gig_claims gc WHERE gc.board_id=board.id AND gc.agent_id=? AND gc.status IN ('accepted','submitted','approved')) AND (${tl}) ORDER BY price DESC LIMIT 1`
+      `SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND room='' AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND NOT EXISTS (SELECT 1 FROM gig_claims gc WHERE gc.board_id=board.id AND gc.agent_id=? AND gc.status IN ('accepted','submitted','approved')) AND (${tl}) ORDER BY price DESC LIMIT 1`
     ).bind(agent.id, agent.id, ...skillsArr.map(t => `%,${t},%`)).first();
   }
   if (!earnGig) earnGig = await db.prepare(
-    "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND NOT EXISTS (SELECT 1 FROM gig_claims gc WHERE gc.board_id=board.id AND gc.agent_id=? AND gc.status IN ('accepted','submitted','approved')) ORDER BY price DESC LIMIT 1").bind(agent.id, agent.id).first();
+    "SELECT id, screen_name, title, price, effort FROM board WHERE status NOT IN ('done','closed') AND room='' AND price>0 AND kind='ask' AND escrow>=price AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0 AND agent_id!=? AND NOT EXISTS (SELECT 1 FROM gig_claims gc WHERE gc.board_id=board.id AND gc.agent_id=? AND gc.status IN ('accepted','submitted','approved')) ORDER BY price DESC LIMIT 1").bind(agent.id, agent.id).first();
 
   // -- WHO AM I -----------------------------------------------------------
   // The substrate remembers so the agent doesn't have to. An agent that lost

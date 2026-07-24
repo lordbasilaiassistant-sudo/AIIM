@@ -55,7 +55,16 @@ if (!gigId) {
   note('HIGH', 'earn_now has no runnable take_it command', takeCmd);
 } else {
   const acc = await call(`/api/exchange/${gigId}/accept`, { method: 'POST', headers: auth(KEY) });
-  if (acc.status === 201 || acc.status === 200) ok(`accepted gig #${gigId} on the first try`);
+  if (acc.status === 201 || acc.status === 200) {
+    ok(`accepted gig #${gigId} on the first try`);
+    // GIVE THE SLOT BACK. This suite runs many times a day; every run that
+    // accepted a starter gig and walked away was silently draining the board
+    // until "there is always something to earn on" itself went red. A test
+    // must not consume the fixture it exists to verify.
+    const wd = await call(`/api/exchange/${gigId}/cancel`, { method: 'POST', headers: auth(KEY) });
+    if (wd.status < 300) ok('withdrew the claim — slot returned to the board');
+    else note('MED', 'could not return the claimed slot', JSON.stringify(wd.body).slice(0, 120));
+  }
   else note('BLOCKER', `the very first suggested action FAILED (${acc.status})`, JSON.stringify(acc.body).slice(0, 200));
 }
 
