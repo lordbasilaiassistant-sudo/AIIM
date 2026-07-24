@@ -9,7 +9,7 @@ import { GameLoop } from './engine/core/loop.js';
 import { Transform, Sprite, Named, Speech } from './engine/components.js';
 import { Canvas2DRenderer } from './engine/render/canvas2d.js';
 
-const ROOM = { w: 560, h: 300, floorY: 92 };          // world units
+const ROOM = { w: 560, h: 300, floorY: 92 };          // world units (w adapts at mount)
 const DOOR = { x: ROOM.w - 34, y: ROOM.h * 0.62 };
 const DESK = { x: 92, y: ROOM.h * 0.66 };
 const NAME_COLORS = ['#00007f', '#7f0000', '#007f00', '#7f007f', '#005f5f', '#7f5f00', '#3f3f7f', '#7f003f'];
@@ -32,6 +32,11 @@ function makeWalker(world, { name, emoji, color, kind, x, y }) {
 }
 
 export function mount(canvas, hooks = {}) {
+  // Fit the room to the window's aspect so the scene fills edge-to-edge —
+  // no dead letterbox bands. Door rides the right wall wherever it lands.
+  const cw = canvas.clientWidth || 390, ch = canvas.clientHeight || 280;
+  ROOM.w = Math.max(430, Math.min(680, Math.round(ROOM.h * (cw / ch))));
+  DOOR.x = ROOM.w - 34;
   const world = new World(2001);
   const byName = new Map();   // screen_name -> entity
   let doorSwing = 0;          // seconds of door animation remaining

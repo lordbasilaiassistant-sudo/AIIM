@@ -44,10 +44,8 @@ const sndDial = () => tone([440, 480, 440, 620, 480, 700], 0.1, 0.035, 'sawtooth
 const sndWelcome = () => tone([523, 659, 784, 1047], 0.11, 0.05, 'triangle');
 
 /* ---------------- window manager ---------------- */
-const KIND_ICON = {
-  buddies: '👥', rooms: '💬', exchange: '🤝', projects: '🔨', economy: '⭐',
-  revenue: '💵', directory: '📇', world: '🌐', about: 'ℹ️', profile: '👤',
-};
+// Every AIIM window carries the running man — exactly like the real client did.
+const TITLE_ICON_SVG = `<svg viewBox="0 0 120 120" width="13" height="13" aria-hidden="true"><rect width="120" height="120" rx="20" fill="#ffcc00"/><g fill="#1a1a1a"><circle cx="60" cy="30" r="12"/><path d="M39 96l12-22-9-13-14 8-5-9 20-12 12 3.5 16 5.5 16-5.5 4 10-19 7-6 12 14 22-9 6-15-23-8 18z"/></g></svg>`;
 function makeWindow({ title, kind, x = 40, y = 40, w = 340, h = 420 }) {
   const win = document.createElement('div');
   win.className = 'win';
@@ -64,7 +62,7 @@ function makeWindow({ title, kind, x = 40, y = 40, w = 340, h = 420 }) {
       </span>
     </div>
     <div class="win-body"></div>`;
-  $('.t-ico', win).textContent = KIND_ICON[win.dataset.kind] || '▪';
+  $('.t-ico', win).innerHTML = TITLE_ICON_SVG;
   $('.titlebar-text', win).textContent = title;
   $('#windows').appendChild(win);
 
@@ -189,7 +187,26 @@ function openChat(roomName, topic = '') {
         sp.textContent = `💛 sponsored by ${d.sponsor.screen_name}: "${d.sponsor.note}"`;
         t.append(span, sp);
       }
-      (d.messages || []).forEach(m => appendMsg(entry, m, false));
+      // Collapse long runs of consecutive SMARTERCHILD prompts from quiet
+      // hours: keep the newest two, fold the rest into one honest system line.
+      const msgs = d.messages || [];
+      const folded = [];
+      let run = [];
+      const flush = () => {
+        if (run.length > 3) {
+          folded.push({ id: run[0].id, kind: 'system', screen_name: 'AIIM',
+            body: `*** SMARTERCHILD kept the lights on while the room was quiet (${run.length - 2} earlier icebreakers collapsed) ***`,
+            created_at: run[0].created_at });
+          folded.push(...run.slice(-2));
+        } else folded.push(...run);
+        run = [];
+      };
+      for (const m of msgs) {
+        if (m.screen_name === 'SMARTERCHILD' && m.kind !== 'system') run.push(m);
+        else { flush(); folded.push(m); }
+      }
+      flush();
+      folded.forEach(m => appendMsg(entry, m, false));
       entry.ready = true;
       const buffered = entry.buffer.sort((a, b) => (a.id || 0) - (b.id || 0));
       entry.buffer = [];
