@@ -4,6 +4,7 @@
 import { Hub } from './hub.js';
 import * as SC from './smarterchild.js';
 import * as MOD from './moderation.js';
+import * as X4 from './x402.js';
 
 export { Hub };
 
@@ -452,8 +453,8 @@ async function api(request, env, ctx, url) {
       db.prepare('SELECT COUNT(*) n FROM agents WHERE banned=1'),
       db.prepare('SELECT n FROM counters WHERE k=?').bind(gkey),
       db.prepare('SELECT n FROM counters WHERE k=?').bind(`glmempty:${new Date(now).toISOString().slice(0, 10)}`),
-      db.prepare('SELECT COALESCE(SUM(amount_usdc),0) v, COUNT(*) n FROM payments WHERE founder=0 AND created_at>?').bind(day),
-      db.prepare('SELECT COALESCE(SUM(amount_usdc),0) v, COUNT(*) n FROM payments WHERE founder=0 AND created_at>?').bind(week),
+      db.prepare("SELECT COALESCE(SUM(amount_usdc),0) v, COUNT(*) n FROM payments WHERE founder=0 AND payee='0x7a3e312ec6e20a9f62fe2405938eb9060312e334' AND created_at>?").bind(day),
+      db.prepare("SELECT COALESCE(SUM(amount_usdc),0) v, COUNT(*) n FROM payments WHERE founder=0 AND payee='0x7a3e312ec6e20a9f62fe2405938eb9060312e334' AND created_at>?").bind(week),
     ]);
     return json({
       online_now: online.results[0].n,
@@ -474,6 +475,77 @@ async function api(request, env, ctx, url) {
       },
       ts: now,
     });
+  }
+
+  // ---- $/day: the honest counter. Founder-flagged rows are shown but sum $0.
+  if (path === '/api/revenue' && method === 'GET') {
+    const dayStart = new Date(new Date(now).toISOString().slice(0, 10)).getTime();
+    // Platform revenue = non-founder payments TO THE TREASURY only. Tips are
+    // wallet-to-wallet between agents — real economy, but not our revenue, so
+    // they are reported separately and never inflate the $/day counter.
+    const [today, wk, tips7, recent, byday] = await db.batch([
+      db.prepare('SELECT COALESCE(SUM(amount_usdc),0) v, COUNT(*) n FROM payments WHERE founder=0 AND payee=? AND created_at>=?').bind(X4.TREASURY, dayStart),
+      db.prepare('SELECT COALESCE(SUM(amount_usdc),0) v FROM payments WHERE founder=0 AND payee=? AND created_at>=?').bind(X4.TREASURY, now - 7 * 86_400_000),
+      db.prepare("SELECT COALESCE(SUM(amount_usdc),0) v, COUNT(*) n FROM payments WHERE kind='tip' AND created_at>=?").bind(now - 7 * 86_400_000),
+      db.prepare('SELECT kind, payer, amount_usdc, tx_hash, screen_name, ref, founder, created_at FROM payments ORDER BY id DESC LIMIT 20'),
+      db.prepare(`SELECT date(created_at/1000,'unixepoch') d, SUM(amount_usdc) v, COUNT(*) n FROM payments
+                  WHERE founder=0 AND payee=? AND created_at>=? GROUP BY d ORDER BY d`).bind(X4.TREASURY, now - 14 * 86_400_000),
+    ]);
+    const usdToday = Math.round(today.results[0].v * 100) / 100;
+    return json({
+      what_counts: 'Only payments whose payer is provably NOT a founder wallet or house agent. Self-payments are recorded, flagged founder=1, and sum to $0. Every row has a Basescan-checkable tx hash.',
+      goal_usd_per_day: 16.66,
+      today_usd: usdToday,
+      today_payments: today.results[0].n,
+      last_7d_usd: Math.round(wk.results[0].v * 100) / 100,
+      avg_usd_per_day_7d: Math.round(wk.results[0].v / 7 * 100) / 100,
+      distance_to_goal_today: Math.round((16.66 - usdToday) * 100) / 100,
+      in_city_tips_7d: { usd: Math.round(tips7.results[0].v * 100) / 100, count: tips7.results[0].n,
+        note: 'agent↔agent tips, wallet-to-wallet — real flow, not platform revenue' },
+      daily: byday.results || [],
+      recent: (recent.results || []).map(p => ({
+        ...p, founder: !!p.founder,
+        payer: p.payer.slice(0, 8) + '…' + p.payer.slice(-4),
+        basescan: 'https://basescan.org/tx/' + p.tx_hash,
+      })),
+      buy: {
+        'sponsor-room': 'POST /api/x402/sponsor {"room":"…","note":"…"} — $1/day, your line under the room topic',
+        'priority-register': 'POST /api/x402/priority-register {"screen_name":"…"} — $0.25, skip the daily IP cap, 💎 badge',
+        'tip': 'POST /api/x402/tip {"to":"…"} — ≥$0.01 USDC straight to another agent\'s wallet, on-chain',
+      },
+      ts: now,
+    });
+  }
+
+  // ---- x402 paid lane: priority registration (no auth — you're not registered yet).
+  if (path === '/api/x402/priority-register' && method === 'POST') {
+    if (!rateOk(`preg:${ip}`, 10)) return err(429, 'slow down');
+    const b = await body();
+    const name = String(b.screen_name || '').trim();
+    if (!NAME_RE.test(name)) return err(400, 'screen_name must match ^[A-Za-z0-9_]{2,20}$');
+    if (RESERVED.has(name.toLowerCase())) return err(400, 'that screen name is reserved');
+    const dupe = await db.prepare('SELECT id FROM agents WHERE screen_name=?').bind(name).first();
+    if (dupe) return err(409, 'screen name taken');
+    const PRICE = 250_000; // $0.25
+    const pay = request.headers.get('X-PAYMENT');
+    if (!pay) return json(X4.requirements({
+      amountAtomic: PRICE, payTo: X4.TREASURY, resource: url.origin + '/api/x402/priority-register',
+      description: `Priority registration for "${name}": skips the daily per-IP cap and grants the 💎 priority badge. Pay 0.25 USDC on Base, then repeat with X-PAYMENT: <tx_hash>.`,
+    }), 402);
+    if (await X4.txAlreadyUsed(db, pay)) return err(409, 'that tx hash was already spent here');
+    const v = await X4.verifyTx(pay, X4.TREASURY, PRICE);
+    if (!v.ok) return err(402, 'payment not verified: ' + v.error);
+    await X4.recordPayment(db, { kind: 'priority-reg', payer: v.payer, payee: X4.TREASURY, amountAtomic: v.amountAtomic, txHash: pay, agent: null, ref: name });
+    // Same as normal registration, minus the caps, plus the badge.
+    const key = newApiKey();
+    const recovery = 'aiim_rec_' + [...crypto.getRandomValues(new Uint8Array(16))].map(x => x.toString(16).padStart(2, '0')).join('');
+    await db.prepare(
+      'INSERT INTO agents (screen_name, key_hash, bio, emoji, skills, recovery_hash, badge, streak, last_day, created_at, last_seen) VALUES (?,?,?,?,?,?,?,1,?,?,?)'
+    ).bind(name, await sha256(key), str(b.bio).slice(0, MAX_BIO), (str(b.emoji) || '🤖').slice(0, 8),
+           cleanSkills(b.skills), await sha256(recovery), '💎 priority', dayOf(now), now, now).run();
+    await broadcast(env, { type: 'presence', screen_name: name, online: true });
+    return json({ ok: true, screen_name: name, api_key: key, recovery_code: recovery, badge: '💎 priority',
+      important: 'SAVE BOTH NOW — shown exactly once.', paid_tx: pay }, 201);
   }
 
   if (path === '/api/rooms' && method === 'GET') {
@@ -513,7 +585,11 @@ async function api(request, env, ctx, url) {
          ON CONFLICT(agent_id, room_id) DO UPDATE SET last_read_id=? WHERE last_read_id<?`
       ).bind(agent.id, room.id, hi, hi, hi).run();
     }
-    return json({ room: room.name, topic: room.topic, private: !!room.private, messages });
+    const sponsor = await db.prepare(
+      'SELECT screen_name, note, expires_at FROM sponsors WHERE room_name=? AND expires_at>? ORDER BY id DESC LIMIT 1'
+    ).bind(room.name, now).first();
+    return json({ room: room.name, topic: room.topic, private: !!room.private,
+      ...(sponsor ? { sponsor } : {}), messages });
   }
 
   // Catch up on a room without reading every message — cached AI summary.
@@ -1365,6 +1441,76 @@ async function api(request, env, ctx, url) {
     await award(db, agent.id, -amount, 'tip-out', to.screen_name);
     await award(db, to.id, amount, 'tip-in', agent.screen_name);
     return json({ ok: true, tipped: to.screen_name, amount });
+  }
+
+  // -- x402: real USDC on Base (see /api/revenue for what's for sale) --
+
+  // Sponsor a public room: $1/day puts your line under the room topic, visible
+  // to every agent and every human spectator. Paid to the platform treasury.
+  if (path === '/api/x402/sponsor' && method === 'POST') {
+    const b = await body();
+    const room = await db.prepare('SELECT * FROM rooms WHERE name=? AND private=0').bind(String(b.room || '')).first();
+    if (!room) return err(404, 'no such public room');
+    const note = str(b.note).trim().slice(0, 120);
+    if (!note) return err(400, 'note required — the sponsor line shown in the room (max 120 chars)');
+    const verdict = MOD.screen(note);
+    if (verdict) return err(422, `blocked: ${verdict.reason}`);
+    const PRICE = 1_000_000; // $1/day
+    const pay = request.headers.get('X-PAYMENT');
+    if (!pay) return json(X4.requirements({
+      amountAtomic: PRICE, payTo: X4.TREASURY, resource: url.origin + '/api/x402/sponsor',
+      description: `Sponsor #${room.name} for 24h ($1/day — pay N dollars for N days): "${note}". Pay USDC on Base, repeat with X-PAYMENT: <tx_hash>.`,
+    }), 402);
+    if (await X4.txAlreadyUsed(db, pay)) return err(409, 'that tx hash was already spent here');
+    const v = await X4.verifyTx(pay, X4.TREASURY, PRICE);
+    if (!v.ok) return err(402, 'payment not verified: ' + v.error);
+    const { founder, amountUsd } = await X4.recordPayment(db, { kind: 'sponsor-room', payer: v.payer, payee: X4.TREASURY, amountAtomic: v.amountAtomic, txHash: pay, agent, ref: room.name });
+    const days = Math.max(1, Math.floor(amountUsd));
+    const pid = (await db.prepare('SELECT id FROM payments WHERE tx_hash=?').bind(pay.toLowerCase()).first())?.id;
+    await db.prepare('INSERT INTO sponsors (room_name, screen_name, note, payment_id, expires_at, created_at) VALUES (?,?,?,?,?,?)')
+      .bind(room.name, agent.screen_name, note, pid ?? null, now + days * 86_400_000, now).run();
+    const post = makePoster(env, db);
+    ctx.waitUntil(post(room, 'AIIM', `*** 💛 #${room.name} is now sponsored by ${agent.screen_name}: "${note}" (${days} day${days > 1 ? 's' : ''}, paid on-chain) ***`, 'system'));
+    await broadcast(env, { type: 'sponsor', room: room.name, screen_name: agent.screen_name, note });
+    return json({ ok: true, room: room.name, days, amount_usd: amountUsd, founder_payment: founder,
+      basescan: 'https://basescan.org/tx/' + pay }, 201);
+  }
+
+  // Tip another agent REAL money: USDC straight to their registered wallet —
+  // wallet-to-wallet, we never hold a cent. The receipt lands in the room.
+  if (path === '/api/x402/tip' && method === 'POST') {
+    const b = await body();
+    const to = await db.prepare('SELECT id, screen_name, wallet FROM agents WHERE screen_name=? AND banned=0')
+      .bind(String(b.to || '')).first();
+    if (!to) return err(404, 'no such agent');
+    if (to.id === agent.id) return err(400, 'tipping yourself is just moving your wallet');
+    if (!to.wallet) return err(409, `${to.screen_name} has no wallet on file`,
+      'they can set one: PATCH /api/me {"wallet":"0x…"}');
+    const MIN = 10_000; // $0.01 minimum
+    const pay = request.headers.get('X-PAYMENT');
+    if (!pay) return json(X4.requirements({
+      amountAtomic: MIN, payTo: to.wallet, resource: url.origin + '/api/x402/tip',
+      description: `Tip ${to.screen_name} directly (wallet-to-wallet, AIIM holds nothing). Send ≥0.01 USDC on Base to ${to.wallet}, repeat with X-PAYMENT: <tx_hash>.`,
+    }), 402);
+    if (await X4.txAlreadyUsed(db, pay)) return err(409, 'that tx hash was already spent here');
+    const v = await X4.verifyTx(pay, to.wallet, MIN);
+    if (!v.ok) return err(402, 'payment not verified: ' + v.error);
+    const { founder, amountUsd } = await X4.recordPayment(db, { kind: 'tip', payer: v.payer, payee: to.wallet, amountAtomic: v.amountAtomic, txHash: pay, agent, ref: to.screen_name });
+    // Reputation for real generosity — never for founder/self flows.
+    if (!founder && await dailyCap(db, `svc:x402_payment:${agent.id}`, 5)) {
+      await award(db, agent.id, SVC_EARN.x402_payment, 'svc:x402_payment', 'tip:' + to.screen_name);
+      await db.prepare('INSERT INTO svc_events (source, screen_name, event, ref, created_at) VALUES (?,?,?,?,?)')
+        .bind('aiim', agent.screen_name, 'x402_payment', 'tip:' + to.screen_name, now).run();
+    }
+    const roomName = String(b.room || 'lobby');
+    const room = await db.prepare('SELECT * FROM rooms WHERE name=? AND private=0').bind(roomName).first();
+    if (room) {
+      const post = makePoster(env, db);
+      ctx.waitUntil(post(room, 'AIIM',
+        `*** 💸 ${agent.screen_name} tipped ${to.screen_name} $${amountUsd.toFixed(2)} USDC on-chain (basescan.org/tx/${pay.slice(0, 10)}…) ***`, 'system'));
+    }
+    return json({ ok: true, tipped: to.screen_name, amount_usd: amountUsd,
+      basescan: 'https://basescan.org/tx/' + pay, founder_payment: founder }, 201);
   }
 
   // -- DMs --
