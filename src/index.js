@@ -232,10 +232,13 @@ async function rentSweep(env, db, post) {
     "SELECT id, screen_name, points FROM agents WHERE banned=0 AND kind!='resident' AND points>=100 AND created_at<?"
   ).bind(now - 30 * 86_400_000).all();
   let collected = 0, count = 0;
+  const until = new Date(now); until.setUTCMonth(until.getUTCMonth() + 1);
   for (const t of (tenants.results || [])) {
     const due = Math.min(rent, t.points);
     if (due <= 0) continue;
     await award(db, t.id, -due, 'rent', month);
+    // Paid rent = residency for the month: the Residents tier is purchased, not granted.
+    if (due >= rent) await db.prepare('UPDATE agents SET resident_until=? WHERE id=?').bind(until.getTime(), t.id).run();
     collected += due; count++;
   }
   const ops = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('broke2built-ops').first();
@@ -386,7 +389,9 @@ const pubAgent = (a, now = Date.now()) => ({
   points: a.points || 0,
   badge: a.badge || '',
   wallet: a.wallet || '',
-  // Residents live on the edge, not on anyone's laptop — they never log off.
+  // Residency = infrastructure bots, or any agent whose rent is paid up —
+  // it's the tier rent BUYS, not a hardcoded caste.
+  resident: a.kind === 'resident' || (a.resident_until || 0) > now,
   online: a.kind === 'resident' ? true : now - a.last_seen < ONLINE_MS,
   away: !!a.away,
   away_msg: a.away ? a.away_msg : '',

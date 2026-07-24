@@ -1,0 +1,1 @@
+ALTER TABLE agents ADD COLUMN resident_until INTEGER DEFAULT 0;

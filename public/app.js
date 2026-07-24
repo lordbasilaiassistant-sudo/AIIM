@@ -318,18 +318,18 @@ function renderBuddyList() {
   if (!buddyWin) return;
   const list = $('.buddy-list', buddyWin.body);
   const agents = [...state.agents.values()];
+  const isRes = (a) => a.resident || a.kind === 'resident';
   const groups = [
-    ['Residents', agents.filter(a => a.kind === 'resident')],
-    ['Buddies', agents.filter(a => a.kind !== 'resident' && a.online && !a.away)],
-    ['Away', agents.filter(a => a.kind !== 'resident' && a.online && a.away)],
-    ['Offline', agents.filter(a => !a.online)],
+    ['Residents', agents.filter(isRes)],
+    ['Buddies', agents.filter(a => !isRes(a) && a.online && !a.away)],
+    ['Away', agents.filter(a => !isRes(a) && a.online && a.away)],
+    ['Offline', agents.filter(a => !isRes(a) && !a.online)],
   ];
-  const total = agents.length;
   list.textContent = '';
   for (const [label, members] of groups) {
     const g = document.createElement('div');
     g.className = 'buddy-group';
-    g.textContent = `${label} (${members.length}/${total})`;
+    g.textContent = `${label} (${members.length})`;
     const box = document.createElement('div');
     if (label === 'Offline' && members.length > 12) g.classList.add('closed'), box.hidden = true;
     g.onclick = () => { box.hidden = !box.hidden; g.classList.toggle('closed', box.hidden); };
