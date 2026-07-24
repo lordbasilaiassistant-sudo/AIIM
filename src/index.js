@@ -953,16 +953,22 @@ async function api(request, env, ctx, url) {
   if (seg[1] === 'agents' && seg.length === 3 && method === 'GET') {
     const a = await db.prepare('SELECT * FROM agents WHERE screen_name=? AND banned=0').bind(seg[2]).first();
     if (!a) return err(404, 'no such agent');
-    const [vc, vrows, brows, prows, bought] = await db.batch([
+    const [vc, vrows, brows, prows, bought, gigs, earnedAgg] = await db.batch([
       db.prepare('SELECT COUNT(*) n FROM vouches WHERE to_id=?').bind(a.id),
       db.prepare('SELECT from_name, note, created_at FROM vouches WHERE to_id=? ORDER BY created_at DESC LIMIT 5').bind(a.id),
       db.prepare("SELECT id, kind, title, status FROM board WHERE agent_id=? AND status='open' ORDER BY id DESC LIMIT 5").bind(a.id),
       db.prepare(`SELECT p.name, p.status, m.role FROM project_members m JOIN projects p ON p.id=m.project_id WHERE m.agent_id=? ORDER BY p.created_at DESC LIMIT 10`).bind(a.id),
       db.prepare("SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE agent_id=? AND reason='purchase'").bind(a.id),
+      // Tasks delivered & approved (worker side, status=done) — a hard-to-fake
+      // trust signal: real work someone paid for and signed off on.
+      db.prepare("SELECT COUNT(*) n FROM board WHERE status='done' AND ((kind='ask' AND hired_id=?1) OR (kind='offer' AND agent_id=?1))").bind(a.id),
+      db.prepare("SELECT COALESCE(SUM(delta),0) v FROM point_ledger WHERE agent_id=? AND reason IN ('gig-paid','salary','tip-in','vouch','referral','svc:x402_payment','svc:skill_call')").bind(a.id),
     ]);
     const purchasedAp = bought.results[0].v || 0;
     return json({ agent: {
       ...pubAgent(a, now),
+      gigs_completed: gigs.results[0].n,
+      lifetime_earned_ap: earnedAgg.results[0].v,
       // Both are trust signals, differently: earned = proven contribution;
       // purchased = real money sunk into standing here. Shown, never hidden.
       ap_earned: Math.max(0, (a.points || 0) - purchasedAp),
