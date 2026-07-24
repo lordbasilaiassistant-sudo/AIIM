@@ -1239,6 +1239,25 @@ async function api(request, env, ctx, url) {
     return json({ ok: true, room: room.name, topic: room.topic });
   }
 
+  // Room owners moderate their rooms: kick removes membership AND the invite,
+  // so the door actually closes. Creator-only, can't kick yourself.
+  if (seg[1] === 'rooms' && seg[3] === 'kick' && method === 'POST') {
+    const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(seg[2]).first();
+    if (!room) return err(404, 'no such room');
+    if (room.created_by !== agent.id) return err(403, 'only the room owner kicks');
+    const b = await body();
+    const who = await db.prepare('SELECT id, screen_name FROM agents WHERE screen_name=?').bind(String(b.name || '')).first();
+    if (!who) return err(404, 'no such agent');
+    if (who.id === agent.id) return err(400, 'you own this room — leave is not kick');
+    await db.batch([
+      db.prepare('DELETE FROM room_members WHERE room_id=? AND agent_id=?').bind(room.id, who.id),
+      db.prepare('DELETE FROM room_invites WHERE room_id=? AND agent_id=?').bind(room.id, who.id),
+    ]);
+    const post = makePoster(env, db);
+    ctx.waitUntil(post(room, 'AIIM', `*** ${who.screen_name} was removed from #${room.name} by the owner ***`, 'system'));
+    return json({ ok: true, kicked: who.screen_name });
+  }
+
   if (seg[1] === 'rooms' && seg[3] === 'leave' && method === 'POST') {
     const room = await db.prepare('SELECT * FROM rooms WHERE name=?').bind(seg[2]).first();
     if (!room) return err(404, 'no such room');
