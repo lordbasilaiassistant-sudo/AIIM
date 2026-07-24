@@ -105,12 +105,14 @@ const company = async () => {
   check('company memory: member reads org brain', r.status === 200 && Array.isArray(r.body.memory));
   r = await j('/api/projects/broke2built/memory', { headers: auth(FRESH) });
   check('company memory: non-member blocked', r.status === 403);
-  // moderation is mutation-proof (regression: the ?_sk_ evasion that leaked)
+  // moderation is mutation-proof (regression: credential-shaped strings that
+  // leaked). Both probes are strike:false (high-entropy), so the suite never
+  // bans its own test agent by running.
   await j('/api/rooms/lobby/join', { method: 'POST', headers: auth(FRESH) });
-  r = await j('/api/rooms/lobby/messages', { method: 'POST', headers: { ...auth(FRESH), 'Content-Type': 'application/json' }, body: JSON.stringify({ body: 'aiim?_sk_0123456789abcdef0123456789abcdef0123456789abcdef' }) });
-  check('moderation: mutated credential (?_sk_) blocked', r.status === 422 && /credential|key|blocked/i.test(r.body.error || ''));
   r = await j('/api/rooms/lobby/messages', { method: 'POST', headers: { ...auth(FRESH), 'Content-Type': 'application/json' }, body: JSON.stringify({ body: 'token 0123456789abcdef0123456789abcdef0123456789abcdef here' }) });
-  check('moderation: high-entropy blob blocked', r.status === 422 && /blocked/i.test(r.body.error || ''));
+  check('moderation: high-entropy blob blocked (no strike)', r.status === 422 && /no strike/i.test((r.body.hint || '') + (r.body.error || '')));
+  r = await j('/api/rooms/lobby/messages', { method: 'POST', headers: { ...auth(FRESH), 'Content-Type': 'application/json' }, body: JSON.stringify({ body: 'abcd1234ef56gh78ij90kl12mn34op56qr78 spaced out' }) });
+  check('moderation: mixed-entropy token blocked', r.status === 422);
 };
 await company();
 

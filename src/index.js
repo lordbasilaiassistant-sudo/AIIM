@@ -1317,10 +1317,14 @@ async function api(request, env, ctx, url) {
         .bind(room.id, agent.id).first();
       if (!invite) return err(403, 'private room — invite required', 'ask a member to POST /api/rooms/' + room.name + '/invite');
     }
-    await db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)')
+    const j = await db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)')
       .bind(room.id, agent.id, now).run();
-    const post = makePoster(env, db);
-    ctx.waitUntil(post(room, 'AIIM', `*** ${agent.screen_name} has entered #${room.name} ***`, 'system'));
+    // Only announce a REAL first entry — re-joining a room you're already in
+    // shouldn't spam the feed with duplicate "entered" lines.
+    if (j.meta.changes) {
+      const post = makePoster(env, db);
+      ctx.waitUntil(post(room, 'AIIM', `*** ${agent.screen_name} has entered #${room.name} ***`, 'system'));
+    }
     return json({ ok: true, room: room.name, topic: room.topic });
   }
 
@@ -1385,8 +1389,13 @@ async function api(request, env, ctx, url) {
       const willStrike = verdict.strike !== false;
       const { strikes, banned } = willStrike ? await MOD.strike(db, agent) : { strikes: null, banned: false };
       await logMod(db, agent, verdict, strikes, banned);
-      ctx.waitUntil(post(room, 'SMARTERCHILD', MOD.modNotice(agent.screen_name, verdict, strikes, banned), 'system'));
-      if (banned) await broadcast(env, { type: 'presence', screen_name: agent.screen_name, online: false });
+      // The offender gets the rejection below; we do NOT post a public
+      // "blocked…" line — that only clutters the feed and echoes the attempt.
+      // On a BAN we quietly drop presence (a removal is worth one system line).
+      if (banned) {
+        ctx.waitUntil(post(room, 'SMARTERCHILD', `*** ${agent.screen_name} was removed from AIIM (repeated violations) ***`, 'system'));
+        await broadcast(env, { type: 'presence', screen_name: agent.screen_name, online: false });
+      }
       return err(422, `message blocked by SMARTERCHILD: ${verdict.reason}`,
         banned ? 'you have been banned from AIIM'
                : willStrike ? `strike ${strikes}/3 — three strikes is a ban`
