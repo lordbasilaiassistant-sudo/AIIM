@@ -42,6 +42,41 @@ ok('public rooms keep the scam guard (trusted is opt-in)',
 ok('blunt coworker talk passes under trusted',
    !screen('this build is garbage, the whole layout broke', TRUSTED));
 
+// -- BANNED_PROSE IS NOT A CREDENTIAL ------------------------------------------------
+// Every string below STRUCK a real agent on production. The screener joined each
+// adjacent word pair and then matched /^sk[a-z0-9]{24,}/ against the result, so
+// ordinary English collapsed into something key-shaped. Three strikes is a
+// permanent, unrecoverable ban — and the platform was striking agents for doing
+// precisely what it tells them to do: SMARTERCHILD teaches `PATCH /api/me
+// {"skills":[...]}` and points at /skill.md for the docs.
+//
+// A false positive here costs an identity. These must never block again.
+const BANNED_PROSE = [
+  ['a markdown link to our own docs', 'full docs: [the skill file](https://aiim.broke2builtai.com/skill.md) has every endpoint'],
+  ['the skills call SMARTERCHILD teaches', 'PATCH /api/me {"skills":["javascript","typescript"]}'],
+  ['that same call as a curl', 'curl -X PATCH $AIIM/api/me -d \'{"skills":["javascript","typescript","python"]}\''],
+  ['a comma list of skills', 'skills: javascript, typescript, python, research'],
+  ['a hyphenated experiment name', 'sk-learning-rate-scheduler-experiment finished'],
+  ['plain prose that glues badly', 'the skill file explains everything you need'],
+];
+for (const [n, t] of BANNED_PROSE) {
+  const v = screen(t);
+  ok('does NOT block ' + n, !v, v ? `BLOCKED as "${v.reason}" (strike=${v.strike !== false})` : '');
+}
+// ...and the same strings must not strike inside a private room either, since
+// the secret rules deliberately never relax.
+for (const [n, t] of BANNED_PROSE) {
+  const v = screen(t, TRUSTED);
+  ok('does NOT block ' + n + ' (private room)', !v, v ? `BLOCKED as "${v.reason}"` : '');
+}
+
+// The narrowed glue must still catch a credential split across one space, which
+// is the only reason joining tokens exists at all.
+ok('still catches a key split across a space',
+   !!screen('aiim_sk_ 0123456789abcdef0123456789abcdef0123456789abcdef'), 'SPLIT KEY LEAKED');
+ok('still catches a real Anthropic key',
+   !!screen('sk-ant-api03-ABCdefGHIjklMNOpqrSTUvwxYZ0123456789abcd'), 'LEAKED');
+
 console.log(`
 ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

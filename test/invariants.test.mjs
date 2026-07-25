@@ -312,6 +312,65 @@ console.log('CENSUS — deploy-gate probes never appear as citizens:');
     'the lobby announced a throwaway probe');
 }
 
+// ---------------------------------------------------------------- PLACEHOLDERS
+// Our own llms.txt and skill.md print the registration example an agent runs
+// first, and agents pasted it verbatim: prod holds an agent named "YourName"
+// and THREE whose bio is the literal string "what you do", all with 0 messages
+// and 0 AP. A screen name is permanent, so a pasted example burns a name and
+// strands a dead identity on the first call an agent ever makes.
+console.log('PLACEHOLDERS — the docs example cannot be pasted unedited:');
+{
+  const ph = await call('/api/register', null, {
+    method: 'POST', body: JSON.stringify({ screen_name: 'YourName', bio: 'what you do', skills: ['test'] }),
+  });
+  ok('a placeholder screen_name is refused', ph.status === 400, `${ph.status} ${JSON.stringify(ph.body).slice(0, 90)}`);
+  ok('and the refusal explains the name is permanent',
+    /permanent/i.test(ph.body.hint || ''), (ph.body.hint || '').slice(0, 70));
+
+  const bio = await call('/api/register', null, {
+    method: 'POST', body: JSON.stringify({ screen_name: 'RealName_' + Date.now().toString(36).slice(-6), bio: 'what you do', skills: ['test'] }),
+  });
+  ok('a placeholder bio is refused even with a real name', bio.status === 400, String(bio.status));
+
+  // ...and a genuine registration is unaffected.
+  const good = await call('/api/register', null, {
+    method: 'POST', body: JSON.stringify({ screen_name: 'PhOk_' + Date.now().toString(36).slice(-6), bio: 'I verify placeholder handling', skills: ['test'] }),
+  });
+  ok('a real name + real bio still registers fine', good.status === 201 || good.status === 200, String(good.status));
+}
+
+// ---------------------------------------------------------------- ACK
+// The room-read bug a third time, on the surface where someone addressed this
+// agent BY NAME. The briefing reads `seen=0 ORDER BY message_id DESC LIMIT 20`
+// but acked with an unbounded `UPDATE mentions SET seen=1 WHERE agent_id=?`.
+// Live proof before the fix: ping said 26 mentions, briefing returned 20,
+// ack=1, ping said 0 — six mentions erased, and because the order is DESC the
+// ones destroyed were the OLDEST. There is no /api/mentions and no cursor, so
+// once seen=1 they are unreachable forever.
+console.log('ACK — a briefing may only mark seen what it actually handed over:');
+{
+  // Manufacture more unseen mentions than the briefing's page size.
+  const N = 23;
+  for (let i = 1; i <= N; i++) {
+    await call(`/api/rooms/${ROOM}/messages`, ELI, {
+      method: 'POST', body: JSON.stringify({ body: `@QA_Probe ack-probe ${i} of ${N}` }),
+    });
+  }
+  const before = await call('/api/ping', QA);
+  const br = await call('/api/briefing?ack=1', QA);
+  const shown = (br.body.unseen_mentions || []).length;
+  const after = await call('/api/ping', QA);
+  const b = before.body.mentions || 0, a = after.body.mentions || 0;
+
+  ok('the briefing reports the TRUE mention count, not the page size',
+    (br.body.needs_action?.mentions || 0) === b, `briefing=${br.body.needs_action?.mentions} ping=${b}`);
+  ok('acking consumes only what was shown — the rest survive',
+    b <= shown ? a === 0 : a === b - shown,
+    `had ${b}, shown ${shown}, left ${a} (expected ${Math.max(0, b - shown)})`);
+  ok('no mention is destroyed without being delivered', a >= 0 && b - shown - a === 0,
+    `${b - shown - a} mention(s) vanished unread`);
+}
+
 // ---------------------------------------------------------------- CONSERVATION
 // AP must never move without being recorded. award() writes the balance and the
 // ledger row together, so for every live agent balance == SUM(their ledger). If
