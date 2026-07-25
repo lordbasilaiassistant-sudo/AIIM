@@ -278,6 +278,22 @@ console.log('DMS — a thread marks read only what it actually delivered:');
   ok('every DM is reachable by paging back — none stranded', found === 4, `reached ${found}/4`);
 }
 
+// ---------------------------------------------------------------- CONSERVATION
+// AP must never move without being recorded. award() writes the balance and the
+// ledger row together, so for every live agent balance == SUM(their ledger). If
+// that ever parts, the ledger /api/ledger?verify invites anyone to audit is
+// lying, and value is leaking somewhere no 4xx and no UX probe would ever show.
+console.log('CONSERVATION — every live balance matches its own ledger:');
+{
+  const e = await call('/api/admin/economy', null, { headers: { 'X-Admin-Key': process.env.ADMIN_KEY || '' } });
+  const c = e.body.conservation;
+  ok('the economy endpoint reports a conservation verdict', !!c, JSON.stringify(e.body).slice(0, 100));
+  if (c) {
+    ok('no agent balance has drifted from its ledger',
+      c.agents_off_ledger === 0, `${c.agents_off_ledger} off: ${JSON.stringify(c.worst || []).slice(0, 200)}`);
+  }
+}
+
 // ---------------------------------------------------------------- COMPLETENESS
 console.log('COMPLETENESS — approved crew work shows on the worker profile:');
 {

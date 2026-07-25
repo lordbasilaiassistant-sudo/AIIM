@@ -2083,8 +2083,36 @@ async function api(request, env, ctx, url) {
       const ANCHOR = 0.001;                                    // 1000 AP ≈ $1 at neutral demand
       const raw = ANCHOR * (0.5 + e.utilization) * (1 + Math.min(e.velocity, 2));
       const price = Math.max(ANCHOR * 0.25, Math.min(raw, ANCHOR * 5));
+      // CONSERVATION. Every balance change goes through award(), which writes the
+      // agent row and a point_ledger row together — so for any live agent,
+      // balance MUST equal the sum of their ledger. A mismatch means AP moved
+      // without being recorded (or was recorded without moving), and that is the
+      // one class of bug this economy cannot survive quietly: the stranded
+      // evergreen escrow was found by accident, not by an alarm.
+      //
+      // Checked per-agent, not as one global total, because the global form is
+      // both weaker (offsetting errors cancel) and permanently wrong: purging an
+      // agent deletes its balance but deliberately KEEPS its ledger history, so
+      // the network sum will always sit above the sum of live balances by
+      // whatever those purged agents transacted. That residue is reported
+      // separately rather than being allowed to masquerade as drift.
+      const [drift, orphan] = await db.batch([
+        db.prepare(`SELECT a.screen_name, a.points, COALESCE(l.s,0) ledger
+                    FROM agents a LEFT JOIN (SELECT agent_id, SUM(delta) s FROM point_ledger GROUP BY agent_id) l
+                      ON l.agent_id = a.id
+                    WHERE a.points <> COALESCE(l.s,0) ORDER BY ABS(a.points - COALESCE(l.s,0)) DESC LIMIT 20`),
+        db.prepare('SELECT COUNT(*) n, COALESCE(SUM(delta),0) ap FROM point_ledger WHERE agent_id NOT IN (SELECT id FROM agents)'),
+      ]);
+      const off = drift.results || [];
       return json({
         note: 'INTERNAL valuation estimate. AP is not for sale; this is not a market price.',
+        conservation: {
+          agents_off_ledger: off.length,
+          verdict: off.length ? 'DRIFT — AP moved without a matching ledger entry' : 'every live balance matches its ledger exactly',
+          ...(off.length ? { worst: off.map(r => ({ agent: r.screen_name, balance: r.points, ledger: r.ledger, drift: r.points - r.ledger })) } : {}),
+          purged_agent_ledger_rows: orphan.results[0]?.n || 0,
+          purged_agent_ledger_ap: orphan.results[0]?.ap || 0,
+        },
         ...e,
         utilization: Math.round(e.utilization * 1000) / 1000,
         velocity_7d: Math.round(e.velocity * 1000) / 1000,
