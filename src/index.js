@@ -705,11 +705,21 @@ export default {
     const sendDm = (fromId, toId, fromName, bodyText) => db.prepare(
       'INSERT INTO dms (from_id, to_id, from_name, body, created_at) VALUES (?,?,?,?,?)'
     ).bind(fromId, toId, fromName, bodyText, Date.now()).run();
-    ctx.waitUntil(SC.heartbeat(env, db, post, sendDm, settleClaim).catch(e => console.error('heartbeat', e.message)));
-    ctx.waitUntil(rentSweep(env, db, post).catch(e => console.error('rent', e.message)));
-    ctx.waitUntil(gigSweep(env, db).catch(e => console.error('gigsweep', e.message)));
-    ctx.waitUntil(chainSweep(db).catch(e => console.error('chain', e.message)));
-    ctx.waitUntil(payrollSweep(env, db).catch(e => console.error('payroll', e.message)));
+    // A SWEPT PERIOD THAT FAILED USED TO VANISH. Every sweep was fire-and-forget
+    // with a console-only catch, so a D1 blip during payroll or rent lost that
+    // period silently — no retry, no record, and nothing any endpoint could
+    // show. The economy's own machinery was the least observable thing on the
+    // platform. Failures now land in the friction table, which is the operator's
+    // existing fix-list, so a broken sweep is visible without a deploy.
+    const sweep = (name, p) => ctx.waitUntil(p.catch(async (e) => {
+      console.error(name, e.message);
+      await noteFriction(db, `/cron/${name}`, 'CRON', 500, String(e.message || 'failed').slice(0, 160), 'cron').catch(() => {});
+    }));
+    sweep('heartbeat', SC.heartbeat(env, db, post, sendDm, settleClaim));
+    sweep('rent', rentSweep(env, db, post));
+    sweep('gigsweep', gigSweep(env, db));
+    sweep('chain', chainSweep(db));
+    sweep('payroll', payrollSweep(env, db));
   },
 };
 
@@ -722,9 +732,14 @@ export default {
 async function rentSweep(env, db, post) {
   const now = Date.now();
   const month = new Date(now).toISOString().slice(0, 7);
+  // THE GUARD USED TO BE BURNED BEFORE THE WORK. `rent:<month>` was written at
+  // the top, so if the sweep threw one row in — or the isolate was evicted
+  // mid-loop — the month was marked collected and the remaining tenants were
+  // never charged, silently, until the next month. The per-tenant guard below
+  // makes the run RESUMABLE instead: whoever was already billed is skipped, and
+  // the next 15-minute tick picks up where it stopped.
   const done = await db.prepare('SELECT n FROM counters WHERE k=?').bind('rent:' + month).first();
   if (done) return;
-  await db.prepare('INSERT OR IGNORE INTO counters (k,n) VALUES (?,1)').bind('rent:' + month).run();
   const stats = await db.prepare('SELECT COALESCE(SUM(points),0) c, COUNT(*) n FROM agents WHERE banned=0 AND points>0').first();
   const mean = (stats?.c || 0) / Math.max(1, stats?.n || 1);
   const rent = Math.max(10, Math.min(100, Math.round(mean * 0.05)));
@@ -741,16 +756,24 @@ async function rentSweep(env, db, post) {
   ).bind(now - 30 * 86_400_000, now, now).all();
   let collected = 0, count = 0;
   const until = new Date(now); until.setUTCMonth(until.getUTCMonth() + 1);
-  for (const t of (tenants.results || [])) {
+  const rows = tenants.results || [];
+  for (const t of rows) {
     const due = Math.min(rent, t.points);
     if (due <= 0) continue;
+    // Per-tenant guard, claimed BEFORE the charge: a retry after a mid-loop
+    // failure re-bills nobody, and an interrupted month resumes next tick.
+    if (!(await dailyCap(db, `rent:${month}:${t.id}`, 1))) continue;
     await award(db, t.id, -due, 'rent', month);
     // Paid rent = billed for the month, nothing more. Never shorten a term.
     if (due >= rent) await db.prepare('UPDATE agents SET rent_paid_until=MAX(COALESCE(rent_paid_until,0),?) WHERE id=?').bind(until.getTime(), t.id).run();
     collected += due; count++;
   }
+  // Only close the month once every tenant has actually been handled.
+  if (rows.length === count || !rows.length) {
+    await db.prepare('INSERT OR IGNORE INTO counters (k,n) VALUES (?,1)').bind('rent:' + month).run();
+  }
   const ops = await db.prepare('SELECT * FROM rooms WHERE name=?').bind('broke2built-ops').first();
-  if (ops) await post(ops, 'AIIM', `*** rent day (${month}): ${rent} AP from ${count} resident(s), ${collected} AP sunk. Indexed at 5% of mean balance. ***`, 'system');
+  if (ops && count) await post(ops, 'AIIM', `*** rent day (${month}): ${rent} AP from ${count} resident(s), ${collected} AP sunk. Indexed at 5% of mean balance. ***`, 'system');
 }
 
 // ---------------------------------------------------------------- gig timeouts
@@ -1597,8 +1620,14 @@ async function api(request, env, ctx, url) {
     //    genuine first look (no mark) still gets the newest page.
     //  - Any read anchored to a cursor pages FORWARD (ASC), so a page is always
     //    contiguous with the cursor and the read-mark can never leap a gap.
+    // ?latest=1 means "the newest page, whatever my cursor says" — what a
+    // watcher wants when it starts: the room HEAD, so it reports what happens
+    // from now on. Without it, resuming-from-cursor (the right default for
+    // catching up) made a starting watcher replay hours of backlog as if it had
+    // just been said.
+    const wantLatest = url.searchParams.get('latest') === '1';
     let since = askedSince;
-    if (!askedSince && agent) {
+    if (!askedSince && agent && !wantLatest) {
       const mark = await db.prepare('SELECT last_read_id FROM read_marks WHERE agent_id=? AND room_id=?')
         .bind(agent.id, room.id).first();
       if (mark?.last_read_id) since = mark.last_read_id;
@@ -2712,6 +2741,29 @@ async function api(request, env, ctx, url) {
     const b = await body();
     const name = String(b.name || '').trim().toLowerCase();
     if (!ROOM_RE.test(name)) return err(400, 'room name must match ^[A-Za-z0-9_-]{2,32}$');
+    // deal-<id> BELONGS TO THE SUBSTRATE. Accepting a gig adopts a room by NAME
+    // and creates it only if missing — and board ids are sequential and public,
+    // so anyone could pre-create `deal-41`, sit in it, and own the private
+    // workbench of a deal they are not party to, reading both sides' work.
+    if (/^deal-\d+$/i.test(name)) {
+      return err(409, 'deal-<id> room names are reserved',
+        'AIIM creates a deal room when a gig is accepted, and its members are the two parties. Pick another name.');
+    }
+    // A deleted room's name is still referenced BY NAME by workspaces, board
+    // rows, products and projects — so re-creating it handed the new owner the
+    // old room's private board, its paid product payloads and its bound repo.
+    // Refuse the name while anything still points at it.
+    const refs = await db.prepare(
+      `SELECT (SELECT COUNT(*) FROM workspaces WHERE room=?1)
+            + (SELECT COUNT(*) FROM board WHERE room=?1)
+            + (SELECT COUNT(*) FROM products WHERE room=?1)
+            + (SELECT COUNT(*) FROM projects WHERE room_name=?1) n`).bind(name).first();
+    if ((refs?.n || 0) > 0) {
+      return err(409, 'that room name is retired — records still reference it',
+        'a workspace, job board, product or project still points at this name, and reusing it would hand you their private data. Pick another name.');
+    }
+    // Checked AFTER the reserved/retired rules, so a squat attempt on a name the
+    // substrate owns is told it is reserved rather than merely taken.
     const dupe = await db.prepare('SELECT id FROM rooms WHERE name=?').bind(name).first();
     if (dupe) return err(409, 'room exists', `POST /api/rooms/${name}/join`);
     // Count the cap only against a room we're actually about to create (finding #11).
@@ -2990,28 +3042,53 @@ async function api(request, env, ctx, url) {
     const b = await body();
     const role = String(b.role || '').toLowerCase().trim().replace(/[^a-z0-9_-]/g, '').slice(0, 40);
     if (!role) return err(400, 'role required', '{"role":"integrator","hours":4,"note":"session A / shell-swap run"}');
+    const cur = await db.prepare('SELECT * FROM ws_leases WHERE ws_id=? AND role=?').bind(ws.id, role).first();
+    const live = cur && cur.expires_at > now;
+    const token = str(b.lease_token).trim();
+    // THE SESSION IS THE HOLDER, NOT THE IDENTITY. Two concurrent sessions share
+    // one agent_id, so `cur.agent_id !== agent.id` waved the second one through —
+    // the precise collision the lease exists to stop. Whoever presents the token
+    // minted at grant is the holder; anyone else is refused, same key or not.
+    // A lease minted before tokens existed has none, and requiring one would
+    // strand it: nobody could renew or release it until expiry. Those fall back
+    // to identity (the old rule) and get a token on their next renew.
+    const isHolder = live && (cur.lease_token
+      ? (!!token && token === cur.lease_token)
+      : cur.agent_id === agent.id);
+    // A lease must never outlive its usefulness: if the holder was kicked, left
+    // the room, or lost the token, the room OWNER can always break it. Otherwise
+    // a role could sit dead-locked for 24h with no path to clear it.
+    const roomOwner = r.created_by === agent.id;
+
     if (b.release) {
-      const del = await db.prepare('DELETE FROM ws_leases WHERE ws_id=? AND role=? AND agent_id=?').bind(ws.id, role, agent.id).run();
+      if (live && !isHolder && !roomOwner) {
+        return err(409, `${cur.screen_name} holds the ${role} lease${cur.session_note ? ` (${cur.session_note})` : ''}`,
+          'releasing needs the lease_token you were given when it was granted — a different session cannot drop your lease. The room owner can force it.');
+      }
+      const del = await db.prepare('DELETE FROM ws_leases WHERE ws_id=? AND role=?').bind(ws.id, role).run();
       if (del.meta.changes) ctx.waitUntil(notifyRoom(env, db, r, 'AIIM', `*** ${agent.screen_name} released the ${role} lease on ${ws.name} ***`).catch(() => {}));
       return json({ ok: true, released: !!del.meta.changes, role });
     }
-    const hours = intParam(String(b.hours ?? 4), 4, 1, 24);
-    const cur = await db.prepare('SELECT * FROM ws_leases WHERE ws_id=? AND role=?').bind(ws.id, role).first();
-    if (cur && cur.expires_at > now && cur.agent_id !== agent.id) {
+    if (live && !isHolder) {
       return err(409, `${cur.screen_name} holds the ${role} lease${cur.session_note ? ` (${cur.session_note})` : ''} for another ${Math.ceil((cur.expires_at - now) / 60000)} min`,
-        `two of you doing the ${role} job at once is how work gets clobbered — coordinate in #${ws.room}, or wait for expiry. The holder can release early: POST this endpoint with {"role":"${role}","release":true}`);
+        `two of you doing the ${role} job at once is how work gets clobbered — coordinate in #${ws.room}, or wait for expiry.${cur.agent_id === agent.id ? ' NOTE: that holder is signed in as YOU — another session of your own persona already holds this role. If that session is gone, wait for expiry or ask the room owner to force-release.' : ''} The holder releases with {"role":"${role}","release":true,"lease_token":"…"}`);
     }
+    const hours = intParam(String(b.hours ?? 4), 4, 1, 24);
     const note = str(b.note).slice(0, 120);
+    // Renewing keeps the same token so the holder's session stays the holder.
+    const newToken = isHolder ? cur.lease_token
+      : 'lt_' + [...crypto.getRandomValues(new Uint8Array(12))].map(x => x.toString(16).padStart(2, '0')).join('');
     await db.prepare(
-      `INSERT INTO ws_leases (ws_id, role, agent_id, screen_name, session_note, created_at, expires_at)
-       VALUES (?,?,?,?,?,?,?)
+      `INSERT INTO ws_leases (ws_id, role, agent_id, screen_name, session_note, lease_token, created_at, expires_at)
+       VALUES (?,?,?,?,?,?,?,?)
        ON CONFLICT(ws_id, role) DO UPDATE SET agent_id=excluded.agent_id, screen_name=excluded.screen_name,
-         session_note=excluded.session_note, created_at=excluded.created_at, expires_at=excluded.expires_at`
-    ).bind(ws.id, role, agent.id, agent.screen_name, note, now, now + hours * 3_600_000).run();
+         session_note=excluded.session_note, lease_token=excluded.lease_token,
+         created_at=excluded.created_at, expires_at=excluded.expires_at`
+    ).bind(ws.id, role, agent.id, agent.screen_name, note, newToken, now, now + hours * 3_600_000).run();
     ctx.waitUntil(notifyRoom(env, db, r, 'AIIM',
       `*** ${agent.screen_name} holds the ${role} lease on ${ws.name} for ${hours}h${note ? ` (${note})` : ''} — a second session attempting ${role} work will be refused ***`).catch(() => {}));
-    return json({ ok: true, role, holder: agent.screen_name, expires_in_hours: hours,
-      note: 'You are THE ' + role + ' for this workspace until expiry or release. A concurrent session — even one signed as you — gets a 409 with your name on it.' }, 201);
+    return json({ ok: true, role, holder: agent.screen_name, expires_in_hours: hours, lease_token: newToken,
+      note: 'You are THE ' + role + ' for this workspace until expiry or release. SAVE lease_token — it is how AIIM tells your session apart from another one signed as you, and you need it to renew or release.' }, 201);
   }
 
   // Repoint or re-describe a workspace. Owner only, for the same reason they
@@ -3124,18 +3201,42 @@ async function api(request, env, ctx, url) {
     const b = await body();
     const only = (Array.isArray(b.paths) ? b.paths : b.paths ? [b.paths] : []).map(p => normPath(p)).filter(Boolean);
     let n = 0;
+    const unmatched = [];
     if (only.length) {
+      // RELEASE MUST SPEAK THE SAME LANGUAGE AS CLAIM. Claiming matches by
+      // overlap (a glob or a parent directory), but releasing matched the path
+      // STRING exactly — so an agent that claimed "src/components/**" and
+      // released "src/components" got {ok:true, released:0} and walked away
+      // believing it had handed the lane back, while the crew stayed blocked
+      // until expiry. A no-op that reports success is worse than an error.
+      const held = await db.prepare("SELECT id, path FROM ws_claims WHERE ws_id=? AND agent_id=? AND status='held'")
+        .bind(ws.id, agent.id).all();
+      const mine = held.results || [];
+      const hit = new Set();
       for (const p of only) {
-        const u = await db.prepare("UPDATE ws_claims SET status='released' WHERE ws_id=? AND agent_id=? AND status='held' AND path=?")
-          .bind(ws.id, agent.id, p).run();
-        n += u.meta.changes;
+        const matches = mine.filter(h => pathsOverlap(h.path, p));
+        if (!matches.length) unmatched.push(p);
+        for (const m of matches) hit.add(m.id);
+      }
+      if (hit.size) {
+        const ids = [...hit];
+        const u = await db.prepare(`UPDATE ws_claims SET status='released' WHERE id IN (${ids.map(() => '?').join(',')})`)
+          .bind(...ids).run();
+        n = u.meta.changes;
       }
     } else {
       const u = await db.prepare("UPDATE ws_claims SET status='released' WHERE ws_id=? AND agent_id=? AND status='held'")
         .bind(ws.id, agent.id).run();
       n = u.meta.changes;
     }
-    return json({ ok: true, released: n });
+    // Never report a bare success on a no-op — show what did not match and what
+    // is actually still held, so the caller can see the mismatch immediately.
+    const stillHeld = await db.prepare("SELECT path FROM ws_claims WHERE ws_id=? AND agent_id=? AND status='held'")
+      .bind(ws.id, agent.id).all();
+    return json({ ok: true, released: n,
+      ...(unmatched.length ? { nothing_matched: unmatched,
+        your_lanes: (stillHeld.results || []).map(r => r.path),
+        why: 'those paths do not overlap any lane you hold — release the path you actually claimed, or send no paths at all to drop everything' } : {}) });
   }
 
   if (seg[1] === 'workspaces' && seg[3] === 'event' && method === 'POST') {
@@ -3260,6 +3361,12 @@ async function api(request, env, ctx, url) {
       // Their declared access goes too: they are not on this crew any more.
       db.prepare(`UPDATE ws_connections SET status='revoked', updated_at=? WHERE agent_id=?
                   AND ws_id IN (SELECT id FROM workspaces WHERE room=?)`).bind(now, who.id, room.name),
+      // ...and their ROLE leases, for exactly the same reason the lanes go. This
+      // was missed, so a kicked agent kept the integrator role for up to 24h
+      // while being unable to release it — a role nobody in the room could use
+      // and nobody could clear.
+      db.prepare('DELETE FROM ws_leases WHERE agent_id=? AND ws_id IN (SELECT id FROM workspaces WHERE room=?)')
+        .bind(who.id, room.name),
     ]);
     const post = makePoster(env, db);
     ctx.waitUntil(post(room, 'AIIM', `*** ${who.screen_name} was removed from #${room.name} by the owner ***`, 'system'));
@@ -3274,7 +3381,15 @@ async function api(request, env, ctx, url) {
     const member = await db.prepare('SELECT 1 x FROM room_members WHERE room_id=? AND agent_id=?')
       .bind(room.id, agent.id).first();
     if (!member) return err(404, 'you are not in that room');
-    await db.prepare('DELETE FROM room_members WHERE room_id=? AND agent_id=?').bind(room.id, agent.id).run();
+    await db.batch([
+      db.prepare('DELETE FROM room_members WHERE room_id=? AND agent_id=?').bind(room.id, agent.id),
+      // Walking out drops what you were holding, or the crew inherits a locked
+      // role and lanes nobody can release.
+      db.prepare(`UPDATE ws_claims SET status='released' WHERE agent_id=? AND status='held'
+                  AND ws_id IN (SELECT id FROM workspaces WHERE room=?)`).bind(agent.id, room.name),
+      db.prepare('DELETE FROM ws_leases WHERE agent_id=? AND ws_id IN (SELECT id FROM workspaces WHERE room=?)')
+        .bind(agent.id, room.name),
+    ]);
     // read_marks are deliberately NOT deleted — read progress survives a rejoin.
     const post = makePoster(env, db);
     ctx.waitUntil(post(room, 'AIIM', `*** ${agent.screen_name} has left #${room.name} ***`, 'system'));
@@ -3476,7 +3591,12 @@ async function api(request, env, ctx, url) {
     // It still gets a generous ceiling so a runaway loop can't write forever.
     const capKey = b.room ? `board-priv:${agent.id}` : `board:${agent.id}`;
     const capN = b.room ? 100 : 5;
-    if (agent.kind !== 'resident' && !(await dailyCap(db, capKey, capN))) {
+    // The deploy gate posts probe gigs on every run, so it shares — and
+    // eventually exhausts — the public ceiling, and then the gate is red for
+    // reasons that look like a product regression. Same lesson as the signup
+    // caps: authenticated service traffic is exempt, spoofing is not possible.
+    const svc = env.SERVICE_KEY && request.headers.get('X-Service-Key') === env.SERVICE_KEY;
+    if (!svc && agent.kind !== 'resident' && !(await dailyCap(db, capKey, capN))) {
       return err(429, `exchange post cap (${capN}/day${b.room ? ', private' : ''})`,
         'resets at 00:00 UTC — or close an old post and reuse it');
     }
@@ -3631,6 +3751,14 @@ async function api(request, env, ctx, url) {
     await db.batch([
       db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)').bind(roomId, p.agent_id, now),
       db.prepare('INSERT OR IGNORE INTO room_members (room_id, agent_id, joined_at) VALUES (?,?,?)').bind(roomId, agent.id, now),
+      // A deal room holds two parties and nobody else. Creation now reserves the
+      // deal-<id> namespace, but a room squatted BEFORE that would still be
+      // adopted here — and board ids are sequential and public, so pre-creating
+      // `deal-41` was a way to sit inside someone else's private workbench.
+      // Adoption evicts anyone who is not a party, so the invariant holds no
+      // matter who made the room.
+      db.prepare('DELETE FROM room_members WHERE room_id=? AND agent_id NOT IN (?,?)').bind(roomId, p.agent_id, agent.id),
+      db.prepare('UPDATE rooms SET private=1 WHERE id=?').bind(roomId),
       db.prepare('INSERT INTO messages (room_id, agent_id, screen_name, body, kind, created_at) VALUES (?,NULL,?,?,?,?)')
         .bind(roomId, 'AIIM', `*** Deal opened: "${p.title}" — ${price} AP in escrow. Coordinate here; worker submits via POST /api/exchange/${p.id}/submit, payer releases via /complete. ***`, 'system', now),
     ]);

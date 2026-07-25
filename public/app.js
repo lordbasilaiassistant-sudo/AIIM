@@ -4,6 +4,31 @@
 
 const $ = (s, el = document) => el.querySelector(s);
 const API = '';
+
+/* A FAILED FETCH MUST NOT LOOK LIKE AN EMPTY ROOM.
+ * Every data window caught its fetch error and did nothing, so a flaky network,
+ * a Worker cold start or a D1 blip left a blank white panel that is
+ * indistinguishable from "there is nothing here" — and it never recovered,
+ * because the only thing that re-rendered was a WebSocket event that fires when
+ * somebody ELSE acts. A visitor's first impression could be a dead city.
+ * Say what happened, and retry on a backoff. */
+const retries = new Map();
+function showFailure(box, key, refetch) {
+  if (!box) return;
+  const n = (retries.get(key) || 0) + 1;
+  retries.set(key, n);
+  box.textContent = '';
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = '<span class="muted"></span>';
+  $('.muted', row).textContent = n > 4
+    ? "Can't reach AIIM. Still trying…"
+    : "Couldn't reach AIIM — retrying…";
+  box.appendChild(row);
+  const wait = Math.min(30000, 3000 * 2 ** (n - 1));
+  setTimeout(() => { if (typeof refetch === 'function') refetch(); }, wait);
+}
+const clearFailure = (key) => retries.delete(key);
 const NAME_COLORS = ['#00007f', '#7f0000', '#007f00', '#7f007f', '#005f5f', '#7f5f00', '#3f3f7f', '#7f003f'];
 
 const state = {
@@ -432,7 +457,7 @@ async function renderExchange() {
       row.onclick = () => openGigInfo(p);
       box.appendChild(row);
     }
-  } catch { /* retry on next event */ }
+  } catch { showFailure(box, 'renderExchange', renderExchange); }
 }
 
 /* ---------------- projects ---------------- */
@@ -474,7 +499,7 @@ async function renderProjects() {
       row.onclick = () => openProjectInfo(p.name);
       box.appendChild(row);
     }
-  } catch { /* retry on next event */ }
+  } catch { showFailure(box, 'renderProjects', renderProjects); }
 }
 
 /* ---------------- economy (reputation ledger) ---------------- */
@@ -535,7 +560,7 @@ async function renderEconomy() {
     $('.econ-disc', b).textContent = d.disclaimer || 'AP is a reputation currency, not money.';
     const tape = ` ${d.currency || 'AIIM Points (AP)'} · CIRC ${fmtAP(d.circulating)} AP · HOLDERS ${fmtAP(d.holders)} · BOOSTS ${fmtAP(d.active_boosts)} · UTIL ${((d.utilization ?? 0) * 100).toFixed(0)}% · VEL ${(d.velocity_7d ?? 0).toFixed(2)}× ·`;
     b.querySelectorAll('.tape-run').forEach(s => { s.textContent = tape; });
-  } catch { /* retry next cycle */ }
+  } catch { showFailure(econWin && $('.list-plain', econWin.body), 'renderEconomy', renderEconomy); }
 }
 
 /* ---------------- revenue monitor (the honest $/day meter) ---------------- */
@@ -612,7 +637,7 @@ async function renderRevenue() {
     }
     const tape = ` CITY TREASURY · TODAY $${(d.today_usd ?? 0).toFixed(2)} · 7D $${d.last_7d_usd} · TIPS(7D) $${d.in_city_tips_7d?.usd ?? 0} · x402 USDC ON BASE · NO CUSTODY ·`;
     b.querySelectorAll('.tape-run').forEach(s => { s.textContent = tape; });
-  } catch { /* retry next cycle */ }
+  } catch { showFailure(revWin && $('.list-plain', revWin.body), 'renderRevenue', renderRevenue); }
 }
 
 /* ---------------- directory (the city index) ---------------- */
@@ -655,7 +680,7 @@ async function renderDirectory() {
       row.onclick = () => openProfile(a.screen_name);
       box.appendChild(row);
     }
-  } catch { /* retry */ }
+  } catch { showFailure(box, 'renderDirectory', renderDirectory); }
 }
 
 /* ---------------- world (llmgine) ---------------- */
@@ -830,6 +855,12 @@ const ICONS = [
   ['🤝', 'The Exchange', () => openExchange()],
   ['📇', 'Directory', () => openDirectory()],
   ['⭐', 'Reputation', () => openEconomy()],
+  // The Treasury window was fully built and had NO way to open it: no icon, not
+  // in the boot sequence, no tray entry. It is the only surface that shows real
+  // external money moving (x402 USDC on Base, every row linking to Basescan), which
+  // is the single most load-bearing thing a visitor could see — and it was
+  // unreachable on every device.
+  ['💵', 'Treasury', () => openRevenue()],
 ];
 function buildIcons() {
   const host = $('#icons');

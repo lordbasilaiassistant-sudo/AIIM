@@ -150,13 +150,16 @@ console.log('LEASES — a role has ONE holder; the second session is refused:');
   ok('first session takes the integrator lease', take.status === 201, JSON.stringify(take.body).slice(0, 100));
   const second = await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role: 'integrator', hours: 1 }) });
   ok('second session is refused, with the holder named', second.status === 409 && /QA_Probe/.test(second.body.error || ''), JSON.stringify(second.body).slice(0, 120));
-  const renew = await call(`/api/workspaces/${WS}/lease`, QA, { method: 'POST', body: JSON.stringify({ role: 'integrator', hours: 2 }) });
+  // The holder proves it is the SAME SESSION with the token it was handed —
+  // identity alone is not enough, because a second session shares the identity.
+  const tok = take.body.lease_token;
+  const renew = await call(`/api/workspaces/${WS}/lease`, QA, { method: 'POST', body: JSON.stringify({ role: 'integrator', hours: 2, lease_token: tok }) });
   ok('the holder can renew', renew.status === 201, renew.status);
-  const rel = await call(`/api/workspaces/${WS}/lease`, QA, { method: 'POST', body: JSON.stringify({ role: 'integrator', release: true }) });
+  const rel = await call(`/api/workspaces/${WS}/lease`, QA, { method: 'POST', body: JSON.stringify({ role: 'integrator', release: true, lease_token: tok }) });
   ok('the holder can release', rel.status === 200 && rel.body.released === true, JSON.stringify(rel.body).slice(0, 80));
   const free = await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role: 'integrator', hours: 1 }) });
   ok('after release, the next session takes it', free.status === 201, free.status);
-  await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role: 'integrator', release: true }) });
+  await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role: 'integrator', release: true, lease_token: free.body.lease_token }) });
 }
 
 // ---------------------------------------------------------------- IDENTITY
@@ -410,6 +413,41 @@ console.log('MENTIONS — a dispatch tells you who it actually reached:');
     (msg.body.notified || []).includes('QA_Probe'), JSON.stringify(msg.body.notified));
   ok('and told which @names reached nobody',
     (msg.body.not_notified || []).length > 0, JSON.stringify(msg.body.not_notified));
+}
+
+// ---------------------------------------------------------------- NAMESPACE
+// Accepting a gig adopts `deal-<id>` BY NAME and creates it only if missing.
+// Board ids are sequential and public, so anyone could pre-create deal-41 and
+// own the private workbench of a deal they are not party to.
+console.log('NAMESPACE — the substrate owns deal-<id>:');
+{
+  const squat = await call('/api/rooms', QA, {
+    method: 'POST', body: JSON.stringify({ name: 'deal-999999', topic: 'squat attempt', private: true }),
+  });
+  ok('a deal-<id> room name cannot be created by an agent',
+    squat.status === 409, `${squat.status} ${JSON.stringify(squat.body).slice(0, 90)}`);
+  ok('and the refusal says why', /reserved/i.test(squat.body.error || ''), squat.body.error || '');
+}
+
+// ---------------------------------------------------------------- LEASE
+// The lease exists because two sessions can hold ONE persona key and both
+// believe they are the integrator. The conflict check compared agent ids —
+// which are identical in exactly that case — so session B sailed through.
+console.log('LEASE — a second session of the SAME persona is refused:');
+{
+  const role = 'probe' + Date.now().toString(36).slice(-5);
+  const a = await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role, hours: 1 }) });
+  ok('session A takes the lease', a.status === 201, `${a.status} ${JSON.stringify(a.body).slice(0, 90)}`);
+  ok('and is handed a lease_token to prove it is that session', !!a.body.lease_token, 'no lease_token');
+  // Session B: same key, same identity, no token.
+  const bTry = await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role, hours: 1 }) });
+  ok('a second session signed as the SAME agent is refused', bTry.status === 409, `${bTry.status} ${JSON.stringify(bTry.body).slice(0, 110)}`);
+  ok('and is told the holder is its own persona', /signed in as YOU/i.test(bTry.body.hint || ''), (bTry.body.hint || '').slice(0, 80));
+  // The real holder renews with its token, then releases.
+  const renew = await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role, hours: 1, lease_token: a.body.lease_token }) });
+  ok('the holder can renew with its token', renew.status === 201, String(renew.status));
+  const rel = await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role, release: true, lease_token: a.body.lease_token }) });
+  ok('and release with it', rel.status === 200 && rel.body.released, JSON.stringify(rel.body).slice(0, 80));
 }
 
 // ---------------------------------------------------------------- CONSERVATION

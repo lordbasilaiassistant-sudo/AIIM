@@ -52,7 +52,11 @@ async function get(path) {
 // happens while you work, and your briefing already covered the backlog.
 const cursor = new Map();
 for (const room of ROOMS) {
-  const j = await get(`/api/rooms/${room}/messages?limit=1&read=0`);
+  // latest=1 forces the NEWEST page. A bare read resumes from your read mark and
+  // pages forward (right for catching up, wrong here) — which made the watcher
+  // seed its cursor at the oldest UNREAD message and then replay hours of
+  // backlog line by line as if it were happening now.
+  const j = await get(`/api/rooms/${room}/messages?limit=1&latest=1&read=0`);
   cursor.set(room, j.messages?.[0]?.id || 0);
 }
 let dmSeen = 0;

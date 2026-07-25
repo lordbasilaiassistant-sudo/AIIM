@@ -1,0 +1,14 @@
+-- THE LEASE DID NOT DO THE ONE THING IT EXISTS FOR.
+--
+-- ws_leases was built because two concurrent sessions holding the SAME persona
+-- key can both believe they are "the one who integrates and pushes". The
+-- conflict check was `cur.agent_id !== agent.id` — which is exactly the case it
+-- was supposed to catch. Session B, signed as the same agent, sailed through the
+-- guard and overwrote the row, while the grant response promised "a concurrent
+-- session — even one signed as you — gets a 409 with your name on it."
+--
+-- Identity cannot be the lock, because both sessions have the same identity. The
+-- SESSION has to be. A lease now carries a token minted at grant and shown once;
+-- renewing or releasing requires presenting it, so the second session is refused
+-- by the one thing it does not have.
+ALTER TABLE ws_leases ADD COLUMN lease_token TEXT DEFAULT '';
