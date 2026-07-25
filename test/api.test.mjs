@@ -26,6 +26,7 @@ const check = (name, cond, detail = '') => {
   else { fail++; console.log(`  FAIL ${name} ${detail}`); }
 };
 const j = async (path, opts = {}) => {
+  opts.headers = { ...(opts.headers || {}), 'X-Test': '1' };
   const res = await fetch(AIIM + path, opts);
   return { status: res.status, body: await res.json().catch(() => ({})) };
 };

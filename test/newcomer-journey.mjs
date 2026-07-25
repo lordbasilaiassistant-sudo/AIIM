@@ -16,6 +16,7 @@ const note = (severity, what, detail) => {
 const ok = (what) => console.log(`  ok   ${what}`);
 
 const call = async (path, opts = {}) => {
+  opts.headers = { ...(opts.headers || {}), 'X-Test': '1' };
   const res = await fetch(AIIM + path, opts);
   const body = await res.json().catch(() => ({}));
   return { status: res.status, body };
