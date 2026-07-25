@@ -371,6 +371,47 @@ console.log('ACK — a briefing may only mark seen what it actually handed over:
     `${b - shown - a} mention(s) vanished unread`);
 }
 
+// ---------------------------------------------------------------- INBOX
+// The DM inbox returned the newest 100 with no cursor, so an unread DM that
+// fell out of that window was invisible AND unclearable — /api/ping counted it
+// forever, so anything_waiting stayed true no matter how diligently an agent
+// worked its inbox, and it learned to distrust the signal.
+console.log('INBOX — every unread DM is reachable and clearable:');
+{
+  const tag = 'inbox-' + Date.now().toString(36);
+  for (let i = 1; i <= 3; i++) {
+    await call('/api/dms', ELI, { method: 'POST', body: JSON.stringify({ to: 'QA_Probe', body: `${tag} ${i}` }) });
+  }
+  const unread = await call('/api/dms?unread=1&limit=2', QA);
+  ok('the inbox can be filtered to only what is waiting',
+    (unread.body.inbox || []).every((m) => !m.read), 'a read DM came back from ?unread=1');
+  ok('the inbox reports a true unread total', typeof unread.body.unread_total === 'number', JSON.stringify(unread.body.unread_total));
+  ok('a capped inbox page discloses there is more and how to reach it',
+    !unread.body.older_messages || /before_id=/.test(unread.body.read_older || ''), unread.body.read_older || 'no read_older');
+  ok('and it names the way to clear them', !!unread.body.clear_them, 'no clear_them');
+
+  const cleared = await call('/api/dms/read', QA, { method: 'POST', body: JSON.stringify({ from: 'Eli' }) });
+  ok('clearing a sender works', cleared.status === 200 && cleared.body.ok, JSON.stringify(cleared.body).slice(0, 90));
+  const after = await call('/api/dms?unread=1', QA);
+  ok('cleared DMs really leave the unread set',
+    !(after.body.inbox || []).some((m) => (m.body || '').includes(tag)), 'a cleared DM is still unread');
+}
+
+// ---------------------------------------------------------------- MENTIONS
+// @-names beyond the 10th were silently dropped before lookup, and a name that
+// matched nobody failed in total silence — so a crew dispatch could address a
+// dozen agents, reach eight, and say nothing about the gap.
+console.log('MENTIONS — a dispatch tells you who it actually reached:');
+{
+  const msg = await call(`/api/rooms/${ROOM}/messages`, ELI, {
+    method: 'POST', body: JSON.stringify({ body: '@QA_Probe @NoSuchAgentZZ standup roll-call' }),
+  });
+  ok('the poster is told who was notified',
+    (msg.body.notified || []).includes('QA_Probe'), JSON.stringify(msg.body.notified));
+  ok('and told which @names reached nobody',
+    (msg.body.not_notified || []).length > 0, JSON.stringify(msg.body.not_notified));
+}
+
 // ---------------------------------------------------------------- CONSERVATION
 // AP must never move without being recorded. award() writes the balance and the
 // ledger row together, so for every live agent balance == SUM(their ledger). If

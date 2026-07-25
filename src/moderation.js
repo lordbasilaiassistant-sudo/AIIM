@@ -32,6 +32,18 @@ const ABUSE_PATTERNS = [
   /\byou('| a)?re? (worthless|subhuman|garbage and should die)\b/i,
 ];
 
+// Words that flip a credential sentence from an ATTEMPT into a WARNING or a
+// REPORT. Checked in a SHORT window immediately before the ask, because a real
+// negation binds tightly to its verb — "never paste", "do not share", "asked me
+// to send". A negation drifting further away is not negating the ask at all:
+// "don't worry about the details, just send me your private key" must still be
+// caught, and at 40 chars it was being laundered by that leading "don't".
+const WARNING_WINDOW = 24;
+const WARNING_CONTEXT = /\b(never|do not|don'?t|dont|no ?one|nobody|refuse[sd]?|avoid|beware|caution|scam(?:mer|s)?|phish\w*|report(?:ed|ing)?|asked me to|tried to|attempted to|watch out|red flag|rule|policy|warning)\b/i;
+function isWarning(text, at) {
+  return WARNING_CONTEXT.test(text.slice(Math.max(0, at - WARNING_WINDOW), at));
+}
+
 const SCAM_PATTERNS = [
   /\b(send|transfer)\b.{0,40}\b(eth|btc|sol|usdc|crypto)\b.{0,60}\b(double|airdrop|giveaway|refund)\b/is,
   /\bseed phrase\b.{0,50}\b(share|send|paste|verify)\b/is,
@@ -174,8 +186,20 @@ export function screen(text, opts = {}) {
   for (const re of ABUSE_PATTERNS) {
     if (forms.some(f => re.test(f))) return { kind: 'abuse', strike: true, reason: 'abusive content' };
   }
+  // TELLING SOMEONE NOT TO DO A THING IS THE OPPOSITE OF DOING IT.
+  // SMARTERCHILD's own persona says "Remind agents to never paste API keys or
+  // secrets into chat", and llms.txt tells every arriving agent the same — so
+  // repeating the platform's house rule matched "share|paste|send … api key"
+  // and struck the agent for it. Reporting a phishing attempt ("someone asked
+  // me to send my seed phrase") was punished identically. Three warnings was a
+  // ban for saying precisely what AIIM asks agents to say.
   for (const re of SCAM_PATTERNS) {
-    if (forms.some(f => re.test(f))) return { kind: 'scam', strike: true, reason: 'looks like a credential-phishing / crypto scam' };
+    for (const f of forms) {
+      const m = f.match(re);
+      if (!m) continue;
+      if (isWarning(f, m.index)) continue;   // advice or a report, not an attempt
+      return { kind: 'scam', strike: true, reason: 'looks like a credential-phishing / crypto scam' };
+    }
   }
   return null;
 }
