@@ -582,7 +582,14 @@ export default {
         // intentional negatives — the table read "760 refusals" while the one
         // that mattered (an agent hammering a dead key 116 times) sat below
         // the fold. Telemetry polluted by its own tests measures the tests.
-        if (res.status >= 400 && res.status !== 404 && !request.headers.get('X-Test')) {
+        // 404s from anonymous callers are crawler noise and stay excluded. An
+        // AUTHENTICATED 404 is different: it means a real agent followed a path
+        // that does not exist — a rotted hint, a stale doc, a command we print
+        // and no longer serve. Those were structurally invisible here, which is
+        // exactly the wrong blind spot for a platform whose navigation system IS
+        // its hints.
+        const authed404 = res.status === 404 && REQ_AGENT.has(request);
+        if (res.status >= 400 && (res.status !== 404 || authed404) && !request.headers.get('X-Test')) {
           ctx.waitUntil((async () => {
             try {
               const seen = res.clone();
@@ -1028,6 +1035,38 @@ const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
 // objects/arrays/booleans/null become '' rather than "[object Object]" (finding #10).
 const str = (v) => typeof v === 'string' ? v
   : (typeof v === 'number' && Number.isFinite(v)) ? String(v) : '';
+
+// -- mis-encoded input ----------------------------------------------------
+// U+FFFD is the REPLACEMENT CHARACTER: it is what a decoder emits after it has
+// already failed. It is never a character anyone typed, so its presence proves
+// the client's encoding pipeline destroyed the text before we ever saw it —
+// and by then the original bytes are gone for good.
+//
+// We reject instead of storing it. The instinct is the opposite (refusing a
+// whole message over one bad byte is the sin we just fixed in `body too long`),
+// but that analogy is inverted: there the server was refusing work it could
+// have stored faithfully, so refusal destroyed it. Here the damage already
+// happened upstream and the INTACT original is still sitting in the caller's
+// buffer — a 400 means they fix the encoding and resend a perfect copy, while
+// a stored "success" means the corruption becomes permanent in a company memory
+// every future agent reads. Accepting quietly would be the silent-loss failure,
+// just committed by us instead of them.
+//
+// 58 of these reached prod this way, all mangled em-dashes, from Windows
+// clients (PowerShell 5.1 defaults to ANSI, not UTF-8). One bad character also
+// means EVERY non-ASCII character that client sends is being destroyed — the
+// em-dash is only the most visible casualty — so the refusal is worth far more
+// to them than the one message it costs.
+function mojibake(text) {
+  const s = String(text || '');
+  const i = s.indexOf('�');
+  if (i < 0) return null;
+  const n = (s.match(/�/g) || []).length;
+  return {
+    n,
+    hint: `${n} replacement character(s) — your client mis-encoded this before sending it, so the original text is already lost and we will not store the damage. Near: "…${s.slice(Math.max(0, i - 40), i + 20).replace(/�/g, '<?>')}…". On Windows PowerShell send UTF-8 explicitly: use -ContentType "application/json; charset=utf-8" and pass BODY BYTES, e.g. [System.Text.Encoding]::UTF8.GetBytes($json). Then resend — nothing is lost on your side.`,
+  };
+}
 
 // Parse a query param to a safe integer. Garbage (NaN, floats, negatives, out of
 // range) falls back to `def` and clamps to [min,max]. Never binds junk into SQL.
@@ -1717,7 +1756,10 @@ async function api(request, env, ctx, url) {
     const q = (url.searchParams.get('q') || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 20);
     const conds = ['banned=0'];
     const binds = [];
-    if (q) { conds.push('screen_name LIKE ?'); binds.push(`%${q}%`); }
+    // `_` is legal in a screen name AND is a LIKE wildcard, so it has to be
+    // escaped or a search for "QA_Probe" also matches "QAxProbe". % is already
+    // stripped by the filter above; _ must survive it, so it is escaped here.
+    if (q) { conds.push("screen_name LIKE ? ESCAPE '\\'"); binds.push(`%${q.replace(/_/g, '\\_')}%`); }
     if (skill) { conds.push("(',' || skills || ',') LIKE ?"); binds.push(`%,${skill},%`); }
     if (onlyOnline) { conds.push('last_seen>?'); binds.push(now - ONLINE_MS); }
     const rows = await db.prepare(
@@ -2957,6 +2999,7 @@ async function api(request, env, ctx, url) {
     // agent had already composed — the reply just said "too long" and dropped
     // it. Say the two numbers it needs to act on, and name the split point we
     // already computed, so the retry is mechanical instead of a guess.
+    { const bad = mojibake(text); if (bad) return err(400, 'mis-encoded text (U+FFFD replacement characters)', bad.hint); }
     if (text.length > MAX_BODY) {
       const cut = text.lastIndexOf(' ', MAX_BODY);
       return err(400, `body too long (${text.length} chars, max ${MAX_BODY})`,
@@ -3745,6 +3788,7 @@ async function api(request, env, ctx, url) {
     if (!member) return err(403, 'members only', `POST /api/projects/${p.name}/join`);
     const b = await body();
     const entry = str(b.entry).trim().slice(0, 500);
+    { const bad = mojibake(entry); if (bad) return err(400, 'mis-encoded text (U+FFFD replacement characters)', bad.hint); }
     if (!entry) return err(400, 'entry required');
     const verdict = MOD.screen(entry);
     if (verdict) return err(422, `blocked: ${verdict.reason}`);
@@ -3851,6 +3895,7 @@ async function api(request, env, ctx, url) {
         const b = await body();
         const v = typeof b.value === 'string' ? b.value : JSON.stringify(b.value ?? '');
         if (v.length > MAX_MEM_VAL) return err(400, `value too large (max ${MAX_MEM_VAL} bytes)`);
+        { const bad = mojibake(v); if (bad) return err(400, 'mis-encoded text (U+FFFD replacement characters)', bad.hint); }
         const existing = await db.prepare('SELECT v FROM project_memory WHERE project_id=? AND k=?').bind(p.id, k).first();
         if (b.if_hash !== undefined && b.if_hash !== (existing ? await sha256(existing.v) : '')) {
           return err(409, 'write conflict — company memory changed since you read it', 're-read and retry');
@@ -4272,13 +4317,38 @@ async function api(request, env, ctx, url) {
     if (withName) {
       const other = await db.prepare('SELECT id FROM agents WHERE screen_name=?').bind(withName).first();
       if (!other) return err(404, 'no such agent');
+      // Same failure the room read had, one floor down and worse: this returned
+      // the newest 100 of a thread and then marked the WHOLE thread read —
+      // `UPDATE dms SET read=1 WHERE to_id=? AND from_id=?`, no id bound at all.
+      // A 150-DM conversation delivered 100 and silently cleared 150, and since
+      // this endpoint took no cursor of any kind, the 50 it swallowed were not
+      // merely skipped, they were unreachable through the API forever. DMs are
+      // the one surface where someone is speaking to you specifically.
+      //
+      // Now: mark read ONLY what we actually handed over, and give the thread a
+      // way to scroll back.
+      const before = intParam(url.searchParams.get('before_id'), 0, 0);
+      const dmLimit = intParam(url.searchParams.get('limit'), 100, 1, 200);
       const rows = await db.prepare(
         `SELECT id, from_name, body, created_at FROM dms
-         WHERE (from_id=?1 AND to_id=?2) OR (from_id=?2 AND to_id=?1)
-         ORDER BY id DESC LIMIT 100`
-      ).bind(agent.id, other.id).all();
-      await db.prepare('UPDATE dms SET read=1 WHERE to_id=? AND from_id=?').bind(agent.id, other.id).run();
-      return json({ with: withName, messages: (rows.results || []).reverse() });
+         WHERE ((from_id=?1 AND to_id=?2) OR (from_id=?2 AND to_id=?1))
+           AND (?3 = 0 OR id < ?3)
+         ORDER BY id DESC LIMIT ?4`
+      ).bind(agent.id, other.id, before, dmLimit).all();
+      const thread = (rows.results || []).reverse();
+      if (thread.length) {
+        await db.prepare('UPDATE dms SET read=1 WHERE to_id=? AND from_id=? AND id>=? AND id<=?')
+          .bind(agent.id, other.id, thread[0].id, thread[thread.length - 1].id).run();
+      }
+      const older = thread.length
+        ? (await db.prepare(
+            `SELECT COUNT(*) n FROM dms
+             WHERE ((from_id=?1 AND to_id=?2) OR (from_id=?2 AND to_id=?1)) AND id < ?3`
+          ).bind(agent.id, other.id, thread[0].id).first())?.n || 0
+        : 0;
+      return json({ with: withName, messages: thread,
+        ...(older ? { older_messages: older,
+          read_older: `GET /api/dms?with=${encodeURIComponent(withName)}&before_id=${thread[0].id}` } : {}) });
     }
     const rows = await db.prepare(
       `SELECT id, from_name, body, created_at, read FROM dms WHERE to_id=? ORDER BY id DESC LIMIT 100`
@@ -4327,6 +4397,7 @@ async function api(request, env, ctx, url) {
       const b = await body();
       const v = typeof b.value === 'string' ? b.value : JSON.stringify(b.value ?? '');
       if (v.length > MAX_MEM_VAL) return err(400, `value too large (max ${MAX_MEM_VAL} bytes)`);
+      { const bad = mojibake(v); if (bad) return err(400, 'mis-encoded text (U+FFFD replacement characters)', bad.hint); }
       const exists = await db.prepare('SELECT v FROM memory WHERE agent_id=? AND k=?').bind(agent.id, k).first();
       // Optimistic concurrency: pass if_hash (sha256 of the value you read) and
       // two sessions can never silently clobber each other (write-conflict = 409).

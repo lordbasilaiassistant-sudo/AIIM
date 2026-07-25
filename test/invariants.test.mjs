@@ -226,6 +226,58 @@ console.log('CATCH-UP — falling behind must never silently destroy the backlog
   ok('unread reaches 0 only after the backlog was really delivered', left === 0, `unread=${left}`);
 }
 
+// ---------------------------------------------------------------- ENCODING
+// U+FFFD is proof the caller's encoding already failed. Storing it makes the
+// corruption permanent in text every future agent reads — 58 mangled em-dashes
+// reached prod that way, from Windows clients defaulting to ANSI. Refusing is
+// the kind option: the intact original is still in the caller's buffer.
+console.log('ENCODING — mis-encoded text is refused, clean UTF-8 round-trips:');
+{
+  const bad = await call(`/api/rooms/${ROOM}/messages`, QA, {
+    method: 'POST', body: JSON.stringify({ body: 'shipped the digest � the community has bones now' }),
+  });
+  ok('a message carrying U+FFFD is refused', bad.status === 400, `${bad.status} ${JSON.stringify(bad.body).slice(0, 90)}`);
+  ok('the refusal explains the encoding fix', /utf-8/i.test(bad.body.hint || ''), (bad.body.hint || '').slice(0, 80));
+
+  const okMsg = 'clean — em-dash, “curly”, é, 🔥 ' + Date.now().toString(36);
+  const good = await call(`/api/rooms/${ROOM}/messages`, QA, { method: 'POST', body: JSON.stringify({ body: okMsg }) });
+  ok('legitimate non-ASCII is NOT collateral damage', good.status === 201, String(good.status));
+  const back = await call(`/api/rooms/${ROOM}/messages?limit=5&read=0`, QA);
+  ok('and it round-trips byte-identical',
+    (back.body.messages || []).some(m => m.body === okMsg), 'posted text did not come back intact');
+
+  const badMem = await call('/api/memory/enc-invariant', QA, {
+    method: 'PUT', body: JSON.stringify({ value: 'note � with damage' }),
+  });
+  ok('memory writes are guarded too', badMem.status === 400, String(badMem.status));
+}
+
+// ---------------------------------------------------------------- DMS
+// The room-read bug's twin, one floor down and worse: this returned the newest
+// 100 of a thread then marked the WHOLE thread read with no id bound, and took
+// no cursor at all — so anything it swallowed was unreachable forever.
+console.log('DMS — a thread marks read only what it actually delivered:');
+{
+  const tag = 'dmprobe-' + Date.now().toString(36);
+  for (let i = 1; i <= 4; i++) {
+    await call('/api/dms', ELI, { method: 'POST', body: JSON.stringify({ to: 'QA_Probe', body: `${tag} ${i}` }) });
+  }
+  // Read only the newest 2 of the thread.
+  const page = await call('/api/dms?with=Eli&limit=2', QA);
+  const got = (page.body.messages || []).map(m => m.body);
+  ok('a limited thread read returns only that many', got.length <= 2, `got ${got.length}`);
+  ok('older history is disclosed, not hidden', (page.body.older_messages || 0) > 0, JSON.stringify(page.body.older_messages));
+  ok('and it hands back a way to read further back', /before_id=/.test(page.body.read_older || ''), page.body.read_older || 'no read_older');
+  // The undelivered ones must still be unread.
+  const ping = await call('/api/ping', QA);
+  ok('undelivered DMs are still counted as unread', (ping.body.unread_dms || 0) > 0, `unread_dms=${ping.body.unread_dms}`);
+  // Page back and confirm the older ones are reachable.
+  const older = await call(`/api/dms?with=Eli&limit=10&before_id=${(page.body.messages || [])[0]?.id || 0}`, QA);
+  const all = [...got, ...(older.body.messages || []).map(m => m.body)];
+  const found = [1, 2, 3, 4].filter(i => all.some(b => b.includes(`${tag} ${i}`))).length;
+  ok('every DM is reachable by paging back — none stranded', found === 4, `reached ${found}/4`);
+}
+
 // ---------------------------------------------------------------- COMPLETENESS
 console.log('COMPLETENESS — approved crew work shows on the worker profile:');
 {
