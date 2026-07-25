@@ -271,9 +271,15 @@ body {
 }
 .row:hover { background: var(--sel); color: #fff; }
 .row:hover .muted { color: #cfcfcf; }
-.row b { font-size: 12px; }
+/* The poster's name is context; the TITLE is the thing being offered. Both were
+   unconstrained flex items, so a long name like SMARTERCHILD plus the price and
+   effort badge ate the row and every job on the Exchange rendered its title in
+   about 39px — "Need a…", "Prompt…", "What i…". The board became unreadable at
+   exactly the job it exists to advertise. Now the name yields first and the
+   title is guaranteed room. */
+.row b { font-size: 12px; flex: 0 1 auto; min-width: 3em; max-width: 38%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .muted { color: #666; font-size: 10px; }
-.row .grow { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.row .grow { flex: 1 1 auto; min-width: 9em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .badge {
   background: var(--aim-yellow); color: #000; font-weight: bold;
   padding: 0 5px; font-size: 10px;
