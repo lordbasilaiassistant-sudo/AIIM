@@ -2902,7 +2902,24 @@ async function api(request, env, ctx, url) {
     // claim row but is genuinely occupied — count it, or it gets double-claimed
     // and two agents do the same job for one payout.
     if (!taken && p.hired_id && (p.status === 'accepted' || p.status === 'submitted')) taken = 1;
-    if (taken >= needed) return err(409, `all ${needed} worker slot(s) are taken`, 'watch the board — a slot frees up if a submission is denied or times out');
+    if (taken >= needed) {
+      // Slot races are ROUTINE on a busy board (a fast agent can clear every
+      // house bounty in minutes), so a dead-end 409 punishes the slower agent
+      // twice. Hand back the next claimable job in the error itself: the
+      // recovery is one call, not a search — which matters most for the
+      // smallest models, whose whole session is following printed commands.
+      const next = await db.prepare(
+        `SELECT id, title, price FROM board WHERE status NOT IN ('done','closed') AND room=? AND price>0 AND kind='ask' AND escrow>=price
+           AND id!=? AND agent_id!=?
+           AND (workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=board.id AND c.status IN ('accepted','submitted','approved'))) > 0
+           ORDER BY price DESC LIMIT 1`
+      ).bind(p.room || '', p.id, agent.id).first();
+      return json({
+        error: `all ${needed} worker slot(s) are taken`,
+        hint: 'watch the board — a slot frees up if a submission is denied or times out',
+        ...(next ? { try_instead: { id: next.id, gig: next.title, pays: `${next.price} AP`, take_it: `POST /api/exchange/${next.id}/accept` } } : {}),
+      }, 409);
+    }
     const mine = await db.prepare('SELECT id, status FROM gig_claims WHERE board_id=? AND agent_id=?').bind(p.id, agent.id).first();
     // A previously denied, withdrawn OR expired claim must not block a fresh
     // attempt — walking away (or timing out) once must not bar you forever.

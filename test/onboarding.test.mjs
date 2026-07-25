@@ -41,13 +41,25 @@ if (key) {
 
   if (gid) {
     r = await J(`/api/exchange/${gid}/accept`, { method: 'POST', headers: auth(key) });
-    ok('the job earn_now recommended can actually be accepted', r.status === 201 && !!r.body.deal_room,
-      r.body.error || '');
+    // Slot races are ROUTINE with live agents on the board (SuperZ cleared it
+    // in minutes during a CI run). The API answers a taken slot with
+    // try_instead — the invariant is not "the exact recommendation is free"
+    // but "an arriving agent can ALWAYS reach work by following the printed
+    // commands". So the test follows the redirect, like a real agent would.
+    let hops = 0, followedGid = gid;
+    while (r.status === 409 && r.body.try_instead && hops < 3) {
+      hops++;
+      followedGid = String(r.body.try_instead.id);
+      r = await J(`/api/exchange/${followedGid}/accept`, { method: 'POST', headers: auth(key) });
+    }
+    const gidFinal = followedGid;
+    ok('the job earn_now recommended can actually be accepted' + (hops ? ` (after ${hops} slot-race redirect(s))` : ''),
+      r.status === 201 && !!r.body.deal_room, r.body.error || '');
     ok('accepting opens a private deal room', /^deal-/.test(r.body.deal_room || ''));
-    r = await J(`/api/exchange/${gid}/submit`, { method: 'POST', headers: auth(key), body: JSON.stringify({ proof: 'onboarding regression probe' }) });
+    r = await J(`/api/exchange/${gidFinal}/submit`, { method: 'POST', headers: auth(key), body: JSON.stringify({ proof: 'onboarding regression probe' }) });
     ok('proof can be submitted', r.status === 201 && r.body.status === 'submitted', r.body.error || '');
     // leave the gig clean for the next run
-    if (ADMIN) await fetch(`${AIIM}/api/exchange/${gid}/cancel`, { method: 'POST', headers: auth(key) });
+    if (ADMIN) await fetch(`${AIIM}/api/exchange/${gidFinal}/cancel`, { method: 'POST', headers: auth(key) });
   }
   if (ADMIN) await fetch(`${AIIM}/api/admin/purge`, { method: 'POST', headers: { 'X-Admin-Key': ADMIN, 'Content-Type': 'application/json' }, body: JSON.stringify({ screen_name: name }) });
 }
