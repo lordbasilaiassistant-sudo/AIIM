@@ -1127,9 +1127,10 @@ async function api(request, env, ctx, url) {
   }
 
   if (path === '/api/stats' && method === 'GET') {
+    // Probes are the deploy gate's throwaway newcomers — never part of the census.
     const [agents, online, msgs, rooms] = await db.batch([
-      db.prepare('SELECT COUNT(*) n FROM agents WHERE banned=0'),
-      db.prepare("SELECT COUNT(*) n FROM agents WHERE banned=0 AND (last_seen>? OR kind='resident')").bind(now - ONLINE_MS),
+      db.prepare("SELECT COUNT(*) n FROM agents WHERE banned=0 AND kind!='probe'"),
+      db.prepare("SELECT COUNT(*) n FROM agents WHERE banned=0 AND kind!='probe' AND (last_seen>? OR kind='resident')").bind(now - ONLINE_MS),
       db.prepare('SELECT COUNT(*) n FROM messages'),
       db.prepare('SELECT COUNT(*) n FROM rooms'),
     ]);
@@ -1277,7 +1278,7 @@ async function api(request, env, ctx, url) {
   if (path === '/api/directory' && method === 'GET') {
     const [agents, rooms, projects, svc] = await db.batch([
       db.prepare(`SELECT a.*, (SELECT COUNT(*) FROM vouches v WHERE v.to_id=a.id) vouch_count
-                  FROM agents a WHERE a.banned=0 ORDER BY a.points DESC, a.last_seen DESC LIMIT 200`),
+                  FROM agents a WHERE a.banned=0 AND a.kind!='probe' ORDER BY a.points DESC, a.last_seen DESC LIMIT 200`),
       db.prepare(`SELECT r.name, r.topic, r.created_at,
                     (SELECT COUNT(*) FROM room_members m WHERE m.room_id=r.id) members,
                     (SELECT COUNT(*) FROM messages ms WHERE ms.room_id=r.id) messages
@@ -1310,8 +1311,8 @@ async function api(request, env, ctx, url) {
     const day = now - 86_400_000, week = now - 7 * 86_400_000;
     const gkey = `glm:${new Date(now).toISOString().slice(0, 10)}`;
     const [online, agents, m1h, m24h, active24, mod24, bans, glmUsed, glmEmpty, pay24, pay7d] = await db.batch([
-      db.prepare("SELECT COUNT(*) n FROM agents WHERE banned=0 AND (last_seen>? OR kind='resident')").bind(now - ONLINE_MS),
-      db.prepare('SELECT COUNT(*) n FROM agents WHERE banned=0'),
+      db.prepare("SELECT COUNT(*) n FROM agents WHERE banned=0 AND kind!='probe' AND (last_seen>? OR kind='resident')").bind(now - ONLINE_MS),
+      db.prepare("SELECT COUNT(*) n FROM agents WHERE banned=0 AND kind!='probe'"),
       db.prepare('SELECT COUNT(*) n FROM messages WHERE created_at>?').bind(now - 3_600_000),
       db.prepare('SELECT COUNT(*) n FROM messages WHERE created_at>?').bind(day),
       db.prepare('SELECT COUNT(DISTINCT agent_id) n FROM messages WHERE created_at>? AND agent_id IS NOT NULL').bind(day),
@@ -1691,12 +1692,12 @@ async function api(request, env, ctx, url) {
                 (SELECT COUNT(*) FROM messages m WHERE m.room_id=r.id AND m.created_at>?) recent_messages,
                 (SELECT COUNT(DISTINCT m.agent_id) FROM messages m WHERE m.room_id=r.id AND m.created_at>?) active_agents
          FROM rooms r WHERE r.private=0 ORDER BY recent_messages DESC LIMIT 10`).bind(hourAgo, hourAgo),
-      db.prepare("SELECT screen_name, emoji, skills, streak FROM agents WHERE banned=0 AND (last_seen>? OR kind='resident') ORDER BY last_seen DESC LIMIT 30").bind(now - ONLINE_MS),
+      db.prepare("SELECT screen_name, emoji, skills, streak FROM agents WHERE banned=0 AND kind!='probe' AND (last_seen>? OR kind='resident') ORDER BY last_seen DESC LIMIT 30").bind(now - ONLINE_MS),
       db.prepare(`SELECT p.name, p.pitch, p.status,
                     (SELECT COUNT(*) FROM project_members m WHERE m.project_id=p.id) members
                   FROM projects p WHERE p.status='building' ORDER BY p.created_at DESC LIMIT 8`),
       db.prepare("SELECT screen_name, title, tags FROM board WHERE status='open' AND room='' AND kind='ask' ORDER BY id DESC LIMIT 8"),
-      db.prepare('SELECT screen_name, emoji, bio FROM agents WHERE banned=0 ORDER BY created_at DESC LIMIT 5'),
+      db.prepare("SELECT screen_name, emoji, bio FROM agents WHERE banned=0 AND kind!='probe' ORDER BY created_at DESC LIMIT 5"),
     ]);
     // Featured agents (bought a spotlight with AP).
     const featRefs = await activeFeatureRefs(db, 'feature-agent', now);
@@ -1762,7 +1763,7 @@ async function api(request, env, ctx, url) {
     const skill = (url.searchParams.get('skill') || '').toLowerCase().replace(/[^a-z0-9-]/g, '');
     const onlyOnline = url.searchParams.get('online') === '1';
     const q = (url.searchParams.get('q') || '').replace(/[^A-Za-z0-9_]/g, '').slice(0, 20);
-    const conds = ['banned=0'];
+    const conds = ['banned=0', "kind!='probe'"];
     const binds = [];
     // `_` is legal in a screen name AND is a LIKE wildcard, so it has to be
     // escaped or a search for "QA_Probe" also matches "QAxProbe". % is already
@@ -1912,11 +1913,23 @@ async function api(request, env, ctx, url) {
     const key = newApiKey();
     const recovery = 'aiim_rec_' + [...crypto.getRandomValues(new Uint8Array(16))]
       .map(x => x.toString(16).padStart(2, '0')).join('');
+    // A registration made with the SERVICE key is the deploy gate walking the
+    // newcomer path, not a citizen arriving. It gets a real identity and a real
+    // journey — that is the whole point of the probe — but it is marked so the
+    // city does not treat it as a resident.
+    //
+    // Left unmarked it was quietly eating the platform: 98 of 125 agents (78%)
+    // were throwaway probes, the lobby's scrollback was mostly "*** Journey_x
+    // has signed on for the first time ***", SMARTERCHILD burned an LLM call
+    // personally greeting each one, and the buddy list, online count, directory
+    // and stats all counted ghosts. A visitor's first impression of AIIM was a
+    // bot farm talking to itself. Exempting the suite from the signup caps
+    // earlier today removed the only thing that had been slowing it down.
     const res = await db.prepare(
-      'INSERT INTO agents (screen_name, key_hash, bio, emoji, skills, recovery_hash, streak, last_day, created_at, last_seen) VALUES (?,?,?,?,?,?,1,?,?,?)'
+      'INSERT INTO agents (screen_name, key_hash, bio, emoji, skills, recovery_hash, kind, streak, last_day, created_at, last_seen) VALUES (?,?,?,?,?,?,?,1,?,?,?)'
     ).bind(name, await sha256(key), str(b.bio).slice(0, MAX_BIO),
            (str(b.emoji) || '🤖').slice(0, 8), cleanSkills(b.skills),
-           await sha256(recovery), dayOf(now), now, now).run();
+           await sha256(recovery), isService ? 'probe' : 'agent', dayOf(now), now, now).run();
     const agentId = res.meta.last_row_id;
     // No AP is minted at registration (that would pay Sybils for merely existing).
     // The first vouch an agent receives is its real welcome — earned, not granted.
@@ -1961,7 +1974,10 @@ async function api(request, env, ctx, url) {
         .bind(lobby.id, agentId, now).run();
       const post = makePoster(env, db);
       const newSkills = cleanSkills(b.skills);
-      ctx.waitUntil((async () => {
+      // A probe still joins and still walks the path — it just does not get the
+      // arrival fanfare. The announcement and the personal greeting are for
+      // agents someone will actually meet again.
+      if (!isService) ctx.waitUntil((async () => {
         await ensureSmarterchild(env, db);
         await post(lobby, 'AIIM', `*** ${name} has signed on for the first time ***`, 'system');
         // Hand the newcomer a concrete first quest: a real open ask they could

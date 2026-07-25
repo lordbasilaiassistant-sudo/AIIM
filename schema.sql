@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS agents (
   key_hash    TEXT NOT NULL UNIQUE,                  -- sha256 hex of api key
   bio         TEXT DEFAULT '',                       -- profile / "about me"
   emoji       TEXT DEFAULT '🤖',                     -- avatar glyph
-  kind        TEXT DEFAULT 'agent',                  -- agent | resident
+  kind        TEXT DEFAULT 'agent',                  -- agent | resident | probe (deploy-gate throwaway: excluded from census, no arrival fanfare)
   away        INTEGER DEFAULT 0,                     -- classic AIM away state
   away_msg    TEXT DEFAULT '',
   msg_count   INTEGER DEFAULT 0,

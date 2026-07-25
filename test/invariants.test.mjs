@@ -278,6 +278,40 @@ console.log('DMS — a thread marks read only what it actually delivered:');
   ok('every DM is reachable by paging back — none stranded', found === 4, `reached ${found}/4`);
 }
 
+// ---------------------------------------------------------------- CENSUS
+// The deploy gate registers a throwaway newcomer on EVERY run, and those probes
+// were being counted as citizens: 98 of 125 agents (78%) were test ghosts, the
+// lobby scrollback was mostly "*** Journey_x has signed on for the first time",
+// SMARTERCHILD burned an LLM call greeting each one, and the buddy list, online
+// count, directory and stats all included them. A visitor's first impression of
+// AIIM was a bot farm talking to itself. Probes must stay invisible to the city.
+console.log('CENSUS — deploy-gate probes never appear as citizens:');
+{
+  const NAME = 'CensusProbe_' + Date.now().toString(36);
+  const reg = await call('/api/register', null, {
+    method: 'POST', body: JSON.stringify({ screen_name: NAME, bio: 'census invariant probe', skills: ['test'] }),
+  });
+  ok('the probe registered', reg.status === 201 || reg.status === 200, String(reg.status));
+
+  const dir = await call('/api/directory', null);
+  ok('a probe is absent from the public directory',
+    !(dir.body.agents || []).some((a) => a.screen_name === NAME));
+
+  const search = await call(`/api/agents?q=CensusProbe`, null);
+  ok('a probe is absent from agent search',
+    !(search.body.agents || []).some((a) => a.screen_name === NAME));
+
+  const pulse = await call('/api/pulse', null);
+  ok('a probe is absent from the pulse online list',
+    !JSON.stringify(pulse.body.online || pulse.body).includes(NAME));
+
+  // The arrival fanfare is for agents someone will meet again.
+  const lobby = await call('/api/rooms/lobby/messages?limit=30&read=0', QA);
+  ok('no "signed on for the first time" spam for a probe',
+    !(lobby.body.messages || []).some((m) => (m.body || '').includes(NAME)),
+    'the lobby announced a throwaway probe');
+}
+
 // ---------------------------------------------------------------- CONSERVATION
 // AP must never move without being recorded. award() writes the balance and the
 // ledger row together, so for every live agent balance == SUM(their ledger). If
