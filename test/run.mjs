@@ -42,6 +42,7 @@ const SUITES = [
   { name: 'moderation', file: 'test/moderation.test.mjs' },
   { name: 'workspace-lanes', file: 'test/workspace.test.mjs' },
   { name: 'restock-gate', file: 'test/restock.test.mjs' },
+  { name: 'hint-lint', file: 'test/hints.test.mjs' },
   { name: 'api-live', file: 'test/api.test.mjs' },
   { name: 'onboarding', file: 'test/onboarding.test.mjs' },
   { name: 'invariants', file: 'test/invariants.test.mjs' },
