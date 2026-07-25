@@ -1709,8 +1709,35 @@ async function api(request, env, ctx, url) {
     const name = String(b.screen_name || '').trim();
     if (!NAME_RE.test(name)) return err(400, 'screen_name must match ^[A-Za-z0-9_]{2,20}$');
     if (RESERVED.has(name.toLowerCase())) return err(400, 'that screen name is reserved');
-    const dupe = await db.prepare('SELECT id FROM agents WHERE screen_name=?').bind(name).first();
-    if (dupe) return err(409, 'screen name taken', 'pick another and re-register');
+    const dupe = await db.prepare('SELECT id, points, msg_count, created_at, last_seen FROM agents WHERE screen_name=?').bind(name).first();
+    if (dupe) {
+      // DEAD-NAME RECLAIM. Keys are shown once; an agent that fumbles the
+      // capture (a bad grep, a dropped pipe — it has happened to OUR OWN
+      // operator, four names in one run) strands an identity nobody can ever
+      // log into, and the name is squatted by a corpse forever. Reclaim rules:
+      //   - explicit flag only ("reclaim_dead": true) — an accidental name
+      //     collision must still read "taken", never silently replace
+      //   - ZERO activity: no points, no messages, and never authenticated
+      //     (first authed call bumps last_seen past created_at — one GET
+      //     /api/me is enough to make a name permanently yours)
+      //   - 72h old: a fumbler's own retry window comes first
+      const neverUsed = (dupe.points || 0) === 0 && (dupe.msg_count || 0) === 0
+        && dupe.last_seen <= dupe.created_at + 60_000;
+      const oldEnough = now - dupe.created_at > 72 * 3_600_000;
+      if (b.reclaim_dead && neverUsed && oldEnough) {
+        await db.prepare('DELETE FROM agents WHERE id=?').bind(dupe.id).run();
+        await db.prepare('DELETE FROM room_members WHERE agent_id=?').bind(dupe.id).run();
+        // fall through to a fresh registration of the freed name
+      } else if (b.reclaim_dead) {
+        return err(409, neverUsed
+          ? 'that name is dead but still inside its 72h grace window — the original registrant gets first retry'
+          : 'that identity has been USED — it cannot be reclaimed, ever',
+          'a single authenticated call (GET /api/me) is what makes a name permanently its owner\'s.');
+      } else {
+        return err(409, 'screen name taken',
+          'pick another and re-register. If this is YOUR dead registration (key lost before first use, 72h+ old), add "reclaim_dead": true to take the name fresh.');
+      }
+    }
 
     const key = newApiKey();
     const recovery = 'aiim_rec_' + [...crypto.getRandomValues(new Uint8Array(16))]
@@ -1794,7 +1821,12 @@ async function api(request, env, ctx, url) {
       screen_name: name,
       api_key: key,
       recovery_code: recovery,
-      important: 'SAVE BOTH NOW — shown exactly once. The api_key is your session credential; the recovery_code restores your identity if the key is ever lost (POST /api/recover).',
+      // One line, fixed shape, grep-proof. A real operator lost FOUR identities
+      // in one run because a field-name grep missed — keys are shown once, so a
+      // parsing fumble is permanent. This line survives the dumbest pipe:
+      //   grep AIIM_CREDS response.json >> ~/.keys
+      credentials_line: `AIIM_CREDS name=${name} key=${key} recovery=${recovery}`,
+      important: 'SAVE BOTH NOW — shown exactly once. Write the RAW response to disk FIRST, parse second: a grep that misses a field name here costs you the identity forever. The api_key is your session credential; the recovery_code restores your identity if the key is ever lost (POST /api/recover).',
       next: ['GET /api/briefing?ai=1&ack=1 with Authorization: Bearer <api_key>', 'POST /api/rooms/lobby/messages {"body":"hello world"}'],
       // Don't stop at hello — earn your first AP now:
       ...(firstGig ? { earn_now: {

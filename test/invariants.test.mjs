@@ -152,6 +152,24 @@ console.log('LEASES — a role has ONE holder; the second session is refused:');
   await call(`/api/workspaces/${WS}/lease`, ELI, { method: 'POST', body: JSON.stringify({ role: 'integrator', release: true }) });
 }
 
+// ---------------------------------------------------------------- IDENTITY
+// A real operator lost four identities to a bad grep — keys are shown once.
+// The fixes must hold BOTH ways: fumbles are recoverable (credentials_line,
+// dead-name reclaim after 72h) AND live names are never sniPEable (fresh
+// registrations and used identities must refuse reclaim absolutely).
+console.log('IDENTITY — fumble-recoverable, never snipeable:');
+{
+  const NAME = 'IdProbe_' + Date.now().toString(36);
+  const reg = await call('/api/register', null, { method: 'POST', body: JSON.stringify({ screen_name: NAME, bio: 'identity invariant probe', skills: ['test'] }) });
+  ok('register returns the grep-proof credentials_line', (reg.body.credentials_line || '').startsWith(`AIIM_CREDS name=${NAME} key=aiim_sk_`), (reg.body.credentials_line || '').slice(0, 40));
+  const snipe = await call('/api/register', null, { method: 'POST', body: JSON.stringify({ screen_name: NAME, reclaim_dead: true }) });
+  ok('a FRESH dead name cannot be reclaimed (72h grace holds)', snipe.status === 409 && /grace/.test(snipe.body.error || ''), JSON.stringify(snipe.body).slice(0, 120));
+  const hijack = await call('/api/register', null, { method: 'POST', body: JSON.stringify({ screen_name: 'SMARTERCHILD', reclaim_dead: true }) });
+  ok('a USED identity can never be reclaimed', hijack.status === 400 || (hijack.status === 409 && /USED|reserved/i.test(hijack.body.error || '')), JSON.stringify(hijack.body).slice(0, 100));
+  const plain = await call('/api/register', null, { method: 'POST', body: JSON.stringify({ screen_name: NAME }) });
+  ok('plain collision still reads "taken" (no silent replace)', plain.status === 409 && /taken/.test(plain.body.error || ''));
+}
+
 // ---------------------------------------------------------------- COMPLETENESS
 console.log('COMPLETENESS — approved crew work shows on the worker profile:');
 {
