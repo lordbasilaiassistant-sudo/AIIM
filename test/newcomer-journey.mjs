@@ -32,8 +32,17 @@ if (!/register/i.test(llms)) note('HIGH', 'llms.txt does not show how to registe
 else ok('llms.txt shows the registration call');
 
 console.log(`\n=== STEP 2: register ===`);
+// The ONLY insider thing this journey uses, and it buys no capability: the
+// service key keeps this run off the PUBLIC daily signup counter. The gate
+// registers a stranger on every run, and sharing the public ceiling meant our
+// own verification exhausted it and `npm run ship` went red until 00:00 UTC.
+// Everything the newcomer does after this line is earned from the responses.
 const reg = await call('/api/register', {
-  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    ...(process.env.SERVICE_KEY ? { 'X-Service-Key': process.env.SERVICE_KEY } : {}),
+  },
   body: JSON.stringify({ screen_name: NAME, bio: 'I want to earn money doing real work.', skills: ['research', 'writing'] }),
 });
 if (reg.status !== 201 && reg.status !== 200) {
@@ -50,6 +59,8 @@ if (!reg.body.earn_now) note('HIGH', 'no earn_now — a newcomer is told to regi
 else ok(`earn_now points at real work: "${(reg.body.earn_now.gig || '').slice(0, 48)}"`);
 
 console.log(`\n=== STEP 3: can I actually TAKE the job I was just handed? ===`);
+// Captured mid-claim in step 3 and read in step 4 — see the ordering note below.
+let heldBriefing = null;
 const takeCmd = reg.body.earn_now?.take_it || '';
 const gigId = (takeCmd.match(/exchange\/(\d+)\/accept/) || [])[1];
 if (!gigId) {
@@ -58,6 +69,14 @@ if (!gigId) {
   const acc = await call(`/api/exchange/${gigId}/accept`, { method: 'POST', headers: auth(KEY) });
   if (acc.status === 201 || acc.status === 200) {
     ok(`accepted gig #${gigId} on the first try`);
+    // ORDER IS LOAD-BEARING. The `i_owe` assertion below only means anything
+    // while the claim is still HELD, so it runs here — between accept and
+    // withdraw — not in step 4. Withdrawing first made that check assert that
+    // a *cancelled* gig should appear in i_owe: red on every single run, for a
+    // product that was behaving correctly the whole time. A probe that cries
+    // wolf every run is worse than no probe — it trains you to skip the output
+    // and it silently retired the one invariant it existed to defend.
+    heldBriefing = await call('/api/briefing?ai=1', { headers: auth(KEY) });
     // GIVE THE SLOT BACK. This suite runs many times a day; every run that
     // accepted a starter gig and walked away was silently draining the board
     // until "there is always something to earn on" itself went red. A test
@@ -70,7 +89,7 @@ if (!gigId) {
 }
 
 console.log(`\n=== STEP 4: does the briefing tell me who I am and what I owe? ===`);
-const br = await call('/api/briefing?ai=1', { headers: auth(KEY) });
+const br = heldBriefing || await call('/api/briefing?ai=1', { headers: auth(KEY) });
 if (!br.body.you) note('HIGH', 'briefing has no `you` block');
 else {
   ok('briefing opens with a `you` block');

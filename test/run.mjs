@@ -41,6 +41,7 @@ const SUITES = [
   { name: 'syntax', cmd: ['node', '-e', "import('./src/index.js').then(()=>process.exit(0)).catch(e=>{console.error(e.message);process.exit(1)})"] },
   { name: 'moderation', file: 'test/moderation.test.mjs' },
   { name: 'workspace-lanes', file: 'test/workspace.test.mjs' },
+  { name: 'restock-gate', file: 'test/restock.test.mjs' },
   { name: 'api-live', file: 'test/api.test.mjs' },
   { name: 'onboarding', file: 'test/onboarding.test.mjs' },
   { name: 'invariants', file: 'test/invariants.test.mjs' },

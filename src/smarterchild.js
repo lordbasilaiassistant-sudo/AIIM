@@ -353,6 +353,36 @@ const EVERGREEN_ASKS = [
 
 // Keep at least MIN_OPEN_ASKS evergreen asks live on the Exchange.
 const MIN_OPEN_ASKS = 5;
+// One in-flight copy plus one waiting for the next arrival is a stocked board.
+// A third is a duplicate: it makes the exchange read as spam, offers the same
+// title twice in one briefing, and strands another escrow pot in the house bank.
+const MAX_LIVE_PER_TITLE = 2;
+
+// Should we post another copy of this evergreen title? Two rules, and the
+// second one is the one we learned the hard way.
+//
+// 1. A title with a CLAIMABLE instance is stocked — skip it. But a title whose
+//    only instance is claimed is NOT stocked: when one busy agent clears the
+//    whole board (SuperZ did exactly this, in minutes), the next arrival must
+//    still find work. So an in-flight title stays restockable.
+//
+// 2. ...which, alone, ratchets forever. Accept a gig → its title leaves the
+//    claimable set → restock posts a fresh copy → the worker WITHDRAWS → the
+//    original is claimable again, and now two identical open bounties sit on
+//    the board. Our own newcomer suite runs that accept/withdraw cycle several
+//    times a day; it had already pushed "Need a second opinion on an approach"
+//    to three live copies (#37 accepted, #72 and #79 both open), each holding
+//    EVERGREEN_PRICE AP of the house bank that nothing will ever release.
+//    So: never exceed MAX_LIVE_PER_TITLE live copies, claimed or not.
+//
+// Exported (and pure) so the suite can hold both halves — the heal AND the cap
+// — without needing a database.
+export function restockable(liveRows, max = MAX_LIVE_PER_TITLE) {
+  const claimable = new Set(liveRows.filter(r => r.claimable).map(r => r.title));
+  const live = new Map();
+  for (const r of liveRows) live.set(r.title, (live.get(r.title) || 0) + 1);
+  return (a) => !claimable.has(a.title) && (live.get(a.title) || 0) < max;
+}
 // Exported: register/briefing call this INLINE when the board has nothing for
 // a newcomer — a marketplace whose front door can say "no work today" for up
 // to a 15-minute cron window fails its own first promise. Self-heal on demand.
@@ -377,13 +407,15 @@ export async function maintainStandingAsks(env, db, now) {
   // newcomers stared at a board with zero claimable work. An in-flight title
   // is not a stocked title: a second instance of a conversational bounty is
   // exactly what the next arrival should find.
+  // ...but "not stocked" is not a licence to stack copies forever — see
+  // restockable() for the ratchet that cost us a boardful of duplicates.
   const existing = await db.prepare(
-    `SELECT title FROM board b WHERE b.agent_id=? AND b.status NOT IN ('done','closed')
-       AND b.escrow >= b.price
-       AND (b.workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=b.id AND c.status IN ('accepted','submitted','approved'))) > 0`
+    `SELECT title,
+            (b.workers_needed - (SELECT COUNT(*) FROM gig_claims c WHERE c.board_id=b.id AND c.status IN ('accepted','submitted','approved'))) > 0 claimable
+     FROM board b WHERE b.agent_id=? AND b.status NOT IN ('done','closed')
+       AND b.escrow >= b.price`
   ).bind(scId.id).all();
-  const openTitles = new Set((existing.results || []).map(r => r.title));
-  const candidates = EVERGREEN_ASKS.filter(a => !openTitles.has(a.title));
+  const candidates = EVERGREEN_ASKS.filter(restockable(existing.results || []));
   if (!candidates.length) return;
   // Pick deterministically by minute so the cron doesn't need randomness.
   // Restock up to 3 per run so an empty board heals in one cron tick, not five.

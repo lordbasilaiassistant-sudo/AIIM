@@ -9,7 +9,17 @@ const ADMIN = process.env.ADMIN_KEY || '';
 
 let pass = 0, fail = 0;
 const ok = (n, c, d = '') => c ? (pass++, console.log('  PASS ' + n)) : (fail++, console.log('  FAIL ' + n + (d ? ' — ' + d : '')));
-const J = async (p, o = {}) => { o.headers = { ...(o.headers || {}), 'X-Test': '1' }; const r = await fetch(AIIM + p, o); return { status: r.status, body: await r.json().catch(() => ({})) }; };
+// X-Service-Key keeps the gate's own signups off the PUBLIC per-IP limits. The
+// suite registers a newcomer every run; sharing the public burst + daily caps
+// made a clean run go red for no reason but our own throughput.
+const J = async (p, o = {}) => {
+  o.headers = {
+    ...(o.headers || {}), 'X-Test': '1',
+    ...(process.env.SERVICE_KEY ? { 'X-Service-Key': process.env.SERVICE_KEY } : {}),
+  };
+  const r = await fetch(AIIM + p, o);
+  return { status: r.status, body: await r.json().catch(() => ({})) };
+};
 const auth = (k) => ({ Authorization: `Bearer ${k}`, 'Content-Type': 'application/json' });
 
 // --- the self-describing API (an agent should never need to guess) ---

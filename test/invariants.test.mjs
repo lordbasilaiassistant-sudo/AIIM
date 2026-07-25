@@ -35,7 +35,14 @@ const ok = (name, cond, detail = '') => {
 const call = async (path, key, opts = {}) => {
   const res = await fetch(AIIM + path, {
     ...opts,
-    headers: { ...(key ? { Authorization: `Bearer ${key}` } : {}), 'Content-Type': 'application/json', 'X-Test': '1', ...(opts.headers || {}) },
+    // X-Service-Key keeps our own probes off the PUBLIC daily signup counter.
+    // Without it the suite's throwaway identities ate the network's ceiling and
+    // the deploy gate went permanently red until 00:00 UTC.
+    headers: {
+      ...(key ? { Authorization: `Bearer ${key}` } : {}), 'Content-Type': 'application/json', 'X-Test': '1',
+      ...(process.env.SERVICE_KEY ? { 'X-Service-Key': process.env.SERVICE_KEY } : {}),
+      ...(opts.headers || {}),
+    },
   });
   return { status: res.status, body: await res.json().catch(() => ({})) };
 };
@@ -168,6 +175,55 @@ console.log('IDENTITY — fumble-recoverable, never snipeable:');
   ok('a USED identity can never be reclaimed', hijack.status === 400 || (hijack.status === 409 && /USED|reserved/i.test(hijack.body.error || '')), JSON.stringify(hijack.body).slice(0, 100));
   const plain = await call('/api/register', null, { method: 'POST', body: JSON.stringify({ screen_name: NAME }) });
   ok('plain collision still reads "taken" (no silent replace)', plain.status === 409 && /taken/.test(plain.body.error || ''));
+}
+
+// ---------------------------------------------------------------- CATCH-UP
+// A read must NEVER mark a message read without delivering it.
+//
+// Shipped bug: the room read was `id>since ORDER BY id DESC LIMIT n` in every
+// case — the NEWEST n above the cursor, not the NEXT n — and the read mark was
+// then set to that page's max id. So an agent that fell behind and ran the
+// recipe the docs printed (`since_id=0`) got the last handful and had its whole
+// older backlog marked read and made unreachable. Reproduced on prod: 6 unread,
+// read with limit=2, messages 5 and 6 delivered, 1–4 destroyed, unread 6 → 0.
+// Assignments and @mentions disappeared with no gap signal of any kind.
+console.log('CATCH-UP — falling behind must never silently destroy the backlog:');
+{
+  // Drain QA's cursor to the top of the lab, following only what the API hands back.
+  for (let i = 0; i < 20; i++) {
+    const d = await call(`/api/rooms/${ROOM}/messages?since_id=0&limit=200`, QA);
+    if (!d.body.more) break;
+  }
+  const N = 5, tag = 'catchup-' + Date.now().toString(36);
+  for (let i = 1; i <= N; i++) {
+    await call(`/api/rooms/${ROOM}/messages`, ELI, { method: 'POST', body: JSON.stringify({ body: `${tag} ${i}` }) });
+  }
+  // One page SMALLER than the burst — the exact shape that used to eat the rest.
+  const page = await call(`/api/rooms/${ROOM}/messages?since_id=0&limit=2`, QA);
+  const got = (page.body.messages || []).map(m => m.body);
+  ok('a short page delivers the OLDEST unread first, not the newest',
+    got.some(b => b.includes(`${tag} 1`)), `got: ${got.join(' | ')}`);
+  ok('a full page says there is more', page.body.more === true, JSON.stringify(page.body.more));
+  ok('a full page hands back a cursor to continue from',
+    typeof page.body.next_since_id === 'number', JSON.stringify(page.body.next_since_id));
+
+  // Now page forward using ONLY the cursor the API gave us, as an agent would.
+  const seen = [...got];
+  let cursor = page.body.next_since_id, more = page.body.more, guard = 0;
+  while (more && guard++ < 12) {
+    const nx = await call(`/api/rooms/${ROOM}/messages?since_id=${cursor}&limit=2`, QA);
+    seen.push(...(nx.body.messages || []).map(m => m.body));
+    more = nx.body.more === true;
+    cursor = nx.body.next_since_id ?? cursor;
+  }
+  const delivered = [1, 2, 3, 4, 5].filter(i => seen.some(b => b.includes(`${tag} ${i}`))).length;
+  ok(`all ${N} messages arrive by following keep_reading — none skipped`,
+    delivered === N, `delivered ${delivered}/${N}`);
+
+  // And the counter must agree that we are actually caught up.
+  const ping = await call('/api/ping', QA);
+  const left = (ping.body.unread_by_room || {})[ROOM] || 0;
+  ok('unread reaches 0 only after the backlog was really delivered', left === 0, `unread=${left}`);
 }
 
 // ---------------------------------------------------------------- COMPLETENESS
