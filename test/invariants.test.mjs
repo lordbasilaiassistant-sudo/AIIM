@@ -474,5 +474,53 @@ console.log('COMPLETENESS — approved crew work shows on the worker profile:');
   ok('Struct (approved crew claims) has gigs_completed >= 1', n >= 1, `gigs_completed=${n}`);
 }
 
+// ---------------------------------------------------------------- REVIEW
+// SMARTERCHILD is the first employer almost every newcomer has, and for a while
+// its review was a formality: any proof over 15 characters got paid. "Posted it
+// in #help-desk, message #2910" was approved without anyone ever opening #2910,
+// so a worker who wrote a convincing sentence earned exactly what a worker who
+// did the job earned. The house must open the work it pays for.
+console.log('REVIEW — the house checks the artifact a proof cites, not its shape:');
+{
+  const SC = process.env.SMARTERCHILD_KEY;
+  const beat = () => call('/api/admin/heartbeat', null, { method: 'POST', headers: { 'X-Admin-Key': process.env.ADMIN_KEY || '' } });
+  const MARK = 'ReviewProbe_' + Date.now().toString(36);
+  await call(`/api/rooms/${ROOM}/invite`, ELI, { method: 'POST', body: JSON.stringify({ name: 'SMARTERCHILD' }) });
+  await call(`/api/rooms/${ROOM}/join`, SC, { method: 'POST' });
+  const post = await call('/api/exchange', SC, {
+    method: 'POST',
+    body: JSON.stringify({ kind: 'ask', title: MARK, body: 'Review-invariant probe: say hello in the lab room and cite the message id.', price: 1, effort: 'quick', tags: ['test'], room: ROOM }),
+  });
+  const gid = post.body.id;
+  ok('SMARTERCHILD can post a probe gig in the lab', post.status === 201 && !!gid, `${post.status} ${JSON.stringify(post.body).slice(0, 120)}`);
+
+  if (gid) {
+    // FABRICATED: a message id that cannot exist.
+    await call(`/api/exchange/${gid}/accept`, QA, { method: 'POST' });
+    await call(`/api/exchange/${gid}/submit`, QA, { method: 'POST', body: JSON.stringify({ proof: `Said hello in #${ROOM} as asked — see message #999999999 for the full greeting and my capability lines.` }) });
+    await beat();
+    const c1 = (await call(`/api/exchange/${gid}/claims`, SC)).body.claims || [];
+    const mine1 = c1.find(c => c.screen_name === 'QA_Probe');
+    ok('a proof citing a message that does not exist is DENIED', mine1?.status === 'denied', `status=${mine1?.status} note=${String(mine1?.note || '').slice(0, 90)}`);
+    ok('and the worker is told exactly which id was fake', /999999999/.test(String(mine1?.note || '')), String(mine1?.note || '').slice(0, 120));
+
+    // REAL: do the work, cite the true id.
+    const msg = await call(`/api/rooms/${ROOM}/messages`, QA, { method: 'POST', body: JSON.stringify({ body: `Hello from QA_Probe — review invariant ${MARK}. What I am good at: probing escrow, review and lease paths for bugs before real agents hit them.` }) });
+    const mid = msg.body.id || msg.body.message?.id;
+    ok('the probe can post the real work', !!mid, JSON.stringify(msg.body).slice(0, 120));
+    await call(`/api/exchange/${gid}/accept`, QA, { method: 'POST' });
+    const sub2 = await call(`/api/exchange/${gid}/submit`, QA, { method: 'POST', body: JSON.stringify({ proof: `Said hello in #${ROOM} and named what I am good at — message #${mid} has the greeting and the capability line.` }) });
+    ok('the reopened slot can be re-claimed and re-submitted', sub2.status === 200 || sub2.status === 201, `${sub2.status} ${JSON.stringify(sub2.body).slice(0, 110)}`);
+    await beat();
+    const c2 = (await call(`/api/exchange/${gid}/claims`, SC)).body.claims || [];
+    // /claims is ordered by claim id, so the newest attempt is the last one.
+    const mine2 = c2.filter(c => c.screen_name === 'QA_Probe').pop();
+    ok('a proof citing the worker\'s REAL message is approved', mine2?.status === 'approved', `status=${mine2?.status} note=${String(mine2?.note || '').slice(0, 90)}`);
+    ok('and the approval records what was verified', /verified: #/.test(String(mine2?.note || '')), String(mine2?.note || '').slice(0, 120));
+
+    await call(`/api/exchange/${gid}/cancel`, SC, { method: 'POST' }).catch(() => {});
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

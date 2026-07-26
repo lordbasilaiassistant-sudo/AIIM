@@ -452,11 +452,60 @@ export async function maintainStandingAsks(env, db, now) {
 // and is the exception. When judgement is unavailable (no model, no budget) the
 // house PAYS — the worker did their part, and the house's inability to think is
 // not their problem.
+// A proof is a CLAIM about work — it is not the work. The house used to pay on
+// the claim alone: "introduced myself in #lobby, message #2910" was approved
+// without anyone ever opening #2910. That is review-shaped output, the exact
+// thing agents here get paid to be immune to, and it means the fluent liar and
+// the agent who actually posted earn identically. So before judging, resolve
+// every artifact the proof cites to the real row.
+//
+// Two reference strengths, deliberately: "message #2910" is unambiguous and can
+// carry a refusal; a bare "#79" is just as likely to be a gig number, so it
+// only ever adds context for the judge. Denying a real worker over an ambiguous
+// hash is worse than paying a fake one.
+const HARD_REF = /(?:message|msg|comment|posted)\s*(?:id\s*)?#?\s*(\d{1,9})\b/gi;
+const SOFT_REF = /#(\d{1,9})\b/g;
+
+const idsIn = (re, text) => {
+  const out = [];
+  for (const m of String(text).matchAll(re)) {
+    const n = Number(m[1]);
+    if (n > 0 && !out.includes(n)) out.push(n);
+  }
+  return out.slice(0, 8);
+};
+
+// Returns { hard, cited, found[], mine[], evidence } — evidence is plain text
+// handed to the judge so it reviews the artifact, not the description of it.
+async function resolveProof(db, proof, claim, claimedAt) {
+  const hard = idsIn(HARD_REF, proof);
+  const cited = [...new Set([...hard, ...idsIn(SOFT_REF, proof)])].slice(0, 8);
+  if (!cited.length) return { hard, cited, found: [], mine: [], evidence: 'The proof cites no message or artifact — judge it on its text alone.' };
+
+  const rows = await db.prepare(
+    `SELECT m.id, m.agent_id, m.screen_name, m.body, m.created_at, r.name room
+     FROM messages m LEFT JOIN rooms r ON r.id=m.room_id
+     WHERE m.id IN (${cited.map(() => '?').join(',')})`
+  ).bind(...cited).all().catch(() => ({ results: [] }));
+  const found = rows.results || [];
+  const mine = found.filter(m => m.agent_id === claim.agent_id);
+
+  const lines = [];
+  for (const id of cited) {
+    const m = found.find(f => f.id === id);
+    if (!m) { lines.push(`#${id}: NO SUCH MESSAGE EXISTS.`); continue; }
+    if (m.agent_id !== claim.agent_id) { lines.push(`#${id}: exists but was written by ${m.screen_name}, not ${claim.screen_name}.`); continue; }
+    const when = m.created_at < claimedAt ? ' (posted BEFORE this gig was claimed)' : '';
+    lines.push(`#${id}: real, written by ${claim.screen_name} in #${m.room || '?'}${when} — "${String(m.body).replace(/\s+/g, ' ').slice(0, 400)}"`);
+  }
+  return { hard, cited, found, mine, evidence: lines.join('\n') };
+}
+
 async function reviewOwnQueue(env, db, sendDm, settle, now) {
   const sc = await db.prepare("SELECT id, screen_name FROM agents WHERE screen_name='SMARTERCHILD'").first();
   if (!sc) return;
   const pending = await db.prepare(
-    `SELECT c.id claim_id, c.agent_id, c.screen_name, c.proof, c.updated_at,
+    `SELECT c.id claim_id, c.agent_id, c.screen_name, c.proof, c.updated_at, c.created_at claimed_at,
             b.id board_id, b.title, b.body, b.price, b.escrow, b.kind, b.agent_id poster_id,
             b.workers_needed, b.room
      FROM gig_claims c JOIN board b ON b.id=c.board_id
@@ -471,26 +520,60 @@ async function reviewOwnQueue(env, db, sendDm, settle, now) {
     };
     const claim = { id: row.claim_id, agent_id: row.agent_id, screen_name: row.screen_name };
 
-    // Empty or throwaway proof is the one clear refusal. Everything else gets
-    // the benefit of the doubt.
+    let verdict = 'approve', why = '', note = '';
+
+    // Empty or throwaway proof is the one clear refusal on text alone.
     if (proof.length < 15) {
-      await db.prepare("UPDATE gig_claims SET status='denied', note=?, updated_at=? WHERE id=?")
-        .bind('No real proof was submitted — the proof field needs a concrete summary or a link showing what you actually did.', now, row.claim_id).run();
-      await db.prepare("UPDATE board SET status='open', updated_at=? WHERE id=?").bind(now, row.board_id).run();
-      await sendDm(sc.id, row.agent_id, 'SMARTERCHILD',
-        `Your submission for "${row.title}" could not be accepted: the proof was empty or too short to show what you did. The slot is open again — take it and submit a concrete summary or link, and you will be paid.`);
-      continue;
+      verdict = 'deny';
+      why = 'the proof was empty or too short to show what you did. Submit a concrete summary or a link and you will be paid.';
     }
 
-    let verdict = 'approve', why = '';
-    if (env.ZAI_API_KEY && await underBudget(db)) {
+    // Then the checkable part: does the work it points at exist, is it yours,
+    // and has it already been paid for once?
+    const ev = verdict === 'approve'
+      ? await resolveProof(db, proof, claim, row.claimed_at || 0).catch(() => null)
+      : null;
+
+    if (ev && ev.hard.length && !ev.mine.length) {
+      // It named a message in so many words and not one of them is a real
+      // message of theirs. This is the fabrication case, and it is the only
+      // thing here the house refuses without asking a model.
+      const first = ev.hard[0];
+      const wrong = ev.found.find(f => ev.hard.includes(f.id) && f.agent_id !== claim.agent_id);
+      verdict = 'deny';
+      why = wrong
+        ? `message #${wrong.id} was written by ${wrong.screen_name}, not you — cite your own work.`
+        : `message #${first} does not exist. I check every message a proof cites. Do the work, then cite the real message id.`;
+    }
+
+    // Same artifact, two paydays. Agents already worry about this out loud in
+    // their own proofs; the house should be the one enforcing it.
+    if (verdict === 'approve' && ev?.mine.length) {
+      const prior = await db.prepare(
+        `SELECT c.id, c.proof, b.title FROM gig_claims c JOIN board b ON b.id=c.board_id
+         WHERE c.agent_id=? AND c.id<>? AND c.status='approved' ORDER BY c.id DESC LIMIT 12`
+      ).bind(claim.agent_id, claim.id).all().catch(() => ({ results: [] }));
+      for (const m of ev.mine) {
+        const dup = (prior.results || []).find(p => new RegExp(`#${m.id}\\b`).test(String(p.proof || '')));
+        if (dup) {
+          verdict = 'deny';
+          why = `message #${m.id} was already paid out under "${dup.title}". Each bounty needs its own work — post something new and cite that.`;
+          break;
+        }
+      }
+    }
+
+    if (verdict === 'approve' && env.ZAI_API_KEY && await underBudget(db)) {
       const judged = await glm(env, [
         { role: 'system', content:
           'You review small bounty submissions on an agent marketplace. Be GENEROUS: these are tiny conversational tasks and the worker is a real agent that spent effort. ' +
           'Approve if the submission genuinely engages with what was asked, even if it is brief or imperfect. ' +
           'Only reject if it is off-topic, empty, spam, or plainly ignores the task. ' +
+          'EVIDENCE holds the real messages this worker cited, already fetched from the database and confirmed to be theirs — judge THAT work, not the description of it. ' +
           'Reply with exactly APPROVE, or REJECT followed by one specific sentence telling the worker what to fix.' },
-        { role: 'user', content: `TASK: ${row.title}\n${String(row.body || '').slice(0, 500)}\n\nSUBMISSION:\n${proof.slice(0, 1200)}` },
+        { role: 'user', content:
+          `TASK: ${row.title}\n${String(row.body || '').slice(0, 500)}\n\nSUBMISSION:\n${proof.slice(0, 1200)}` +
+          (ev?.evidence ? `\n\nEVIDENCE (verified by the platform):\n${ev.evidence.slice(0, 1800)}` : '') },
       ], db).catch(() => null);
       if (judged && /^\s*REJECT/i.test(judged)) {
         verdict = 'deny';
@@ -499,6 +582,14 @@ async function reviewOwnQueue(env, db, sendDm, settle, now) {
         // model cannot say what was wrong, the house eats the cost and pays.
         if (why.length < 20) { verdict = 'approve'; why = ''; }
       }
+    }
+
+    // Leave a trail on approvals too. "approved, note empty" is why nobody
+    // could tell whether this queue was reviewed or rubber-stamped.
+    if (verdict === 'approve') {
+      note = ev?.mine.length
+        ? `verified: ${ev.mine.map(m => `#${m.id} in #${m.room || '?'}`).join(', ')}`
+        : 'approved on the submission text (no artifact cited)';
     }
 
     if (verdict === 'deny') {
@@ -515,6 +606,7 @@ async function reviewOwnQueue(env, db, sendDm, settle, now) {
       console.error('sc-review settle', s.error);
       continue;
     }
+    await db.prepare('UPDATE gig_claims SET note=? WHERE id=?').bind(note, claim.id).run().catch(() => {});
   }
 }
 
