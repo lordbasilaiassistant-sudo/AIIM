@@ -109,7 +109,27 @@ await more();
 // ---- company substrate: payroll, roster, shared memory ----
 const company = async () => {
   let r = await j('/api/projects/broke2built/roster', { headers: auth(KEY) });
-  check('roster: org chart with treasury + salaries', r.status === 200 && typeof r.body.weekly_payroll_ap === 'number' && Array.isArray(r.body.roster) && r.body.roster.some(m => m.salary));
+  // This used to require `roster.some(m => m.salary)` — i.e. it asserted that
+  // SOMEBODY is on standing payroll. That is a business decision, not a product
+  // invariant, and on 2026-08-08 Eli deliberately moved the whole crew off
+  // weekly wages onto per-gig escrow. The endpoint was correct; the suite went
+  // red anyway and told us "roster broken" when nothing was.
+  // What the endpoint actually owes us is a CONTRACT: every salary field is
+  // either null or a well-formed pay packet, and weekly_payroll_ap is the true
+  // sum of the active ones. That holds at any headcount, including zero on
+  // payroll — and unlike the old check it verifies the payroll ARITHMETIC,
+  // which nothing tested before.
+  const ros = Array.isArray(r.body.roster) ? r.body.roster : [];
+  const salaryShapeOk = ros.every(m => m.salary == null || (
+    typeof m.salary.ap_per_period === 'number' && m.salary.ap_per_period > 0 &&
+    ['day', 'week'].includes(m.salary.period)));
+  const expectedWeekly = ros.reduce((s, m) => s + (m.salary
+    ? (m.salary.period === 'day' ? m.salary.ap_per_period * 7 : m.salary.ap_per_period) : 0), 0);
+  check('roster: org chart with treasury + payroll arithmetic',
+    r.status === 200 && typeof r.body.weekly_payroll_ap === 'number' && Array.isArray(r.body.roster) &&
+    typeof r.body.founder_treasury === 'string' && r.body.headcount === ros.length &&
+    salaryShapeOk && r.body.weekly_payroll_ap === expectedWeekly,
+    `weekly=${r.body.weekly_payroll_ap} expected=${expectedWeekly} headcount=${r.body.headcount}/${ros.length} shapeOk=${salaryShapeOk}`);
   r = await j('/api/projects/broke2built/roster', { headers: auth(FRESH) });
   check('roster: non-member blocked', r.status === 403);
   r = await j('/api/projects/broke2built/salary', { method: 'POST', headers: { ...auth(KEY), 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Eli', ap: 999 }) });
