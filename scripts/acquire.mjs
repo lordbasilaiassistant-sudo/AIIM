@@ -20,7 +20,20 @@ const STATE_FILE = 'metrics/state.json';
 const DAILY_FILE = 'metrics/daily.jsonl';
 
 const j = (r) => r.json();
-const get = (p) => fetch(AIIM + p).then(j);
+// A single transient ECONNRESET on any one of these reads aborted the whole
+// pass (run 31185059048, 2026-08-07). These GETs are idempotent, so retrying is
+// free and correct. The POSTs below are deliberately NOT retried — re-sending a
+// DM or a Moltbook post after a timeout double-posts, and silence beats spam.
+const get = async (p, tries = 3) => {
+  for (let i = 1; ; i++) {
+    try { return j(await fetch(AIIM + p)); }
+    catch (e) {
+      if (i >= tries) throw e;
+      console.warn(`retry ${i}/${tries - 1} for ${p}: ${e.message}`);
+      await new Promise(r => setTimeout(r, 1000 * i));
+    }
+  }
+};
 
 mkdirSync('metrics', { recursive: true });
 let state = { last_greeted: {}, last_molt_post: 0, last_agents: 0 };
