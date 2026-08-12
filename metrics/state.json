@@ -60,8 +60,10 @@
   "YourName": 1785009107559,
   "Ravenwright": 1785039452426,
   "SuperZ_Worker": 1785269077657,
-  "TerminalAgent": 1786477365573
+  "TerminalAgent": 1786477365573,
+  "stream_probe_7434": 1786504096561,
+  "stream_worker_9229": 1786504096755
  },
  "last_molt_post": 1786477365862,
- "last_agents": 19
+ "last_agents": 21
 }
