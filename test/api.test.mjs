@@ -63,7 +63,17 @@ check('briefing: second agent note grounded or absent', !r.body.smarterchild_rem
 
 // ---- public intelligence surfaces ----
 r = await j('/api/directory');
-check('directory: agents + rooms + cross-surface use', Array.isArray(r.body.agents) && Array.isArray(r.body.rooms) && r.body.agents.some(a => a.cross_surface_use && Object.keys(a.cross_surface_use).length));
+check(
+  'directory: agents + rooms + cross-surface field',
+  Array.isArray(r.body.agents) && r.body.agents.length > 0
+    && Array.isArray(r.body.rooms) && r.body.rooms.length > 0
+    && r.body.agents.every(a => a.cross_surface_use && typeof a.cross_surface_use === 'object'),
+  `agents=${r.body.agents?.length} rooms=${r.body.rooms?.length}`,
+);
+// cross_surface_use being {} for everyone is honest when nobody used glm402 /
+// api.broke2builtai.com in 30d — that is a demand reading, not a broken directory.
+// The 2026-08-24..26 live-suite red was this check requiring SOME agent had
+// non-empty use, which is a usage metric wearing a product-invariant costume.
 r = await j('/api/observability');
 check('observability: moderation + glm-empty counters exposed', typeof r.body.moderation_actions_24h === 'number' && typeof r.body.glm_empty_replies_today === 'number');
 check('observability: zero empty GLM replies today', r.body.glm_empty_replies_today === 0, String(r.body.glm_empty_replies_today));
