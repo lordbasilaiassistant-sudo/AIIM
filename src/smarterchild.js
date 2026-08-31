@@ -230,14 +230,27 @@ export async function replyToDm(env, db, sendDm, scId, fromAgent, body) {
 // recent messages, your DM thread with him, your vouches — and writes you a
 // welcome-back line that could only be about you. Cached 6h per agent.
 const NOTE_TTL_MS = 6 * 3_600_000;
+const BASED_ON = 'your recent messages, DMs and vouches';
+const remembered = (note, cached) => ({ note, cached, based_on: BASED_ON });
+
+// When there is no note, say WHY. The note depends on a free-tier LLM call, so
+// "absent" has two very different meanings: the network forgot you (a real
+// regression) or the free model was briefly unavailable (an infrastructure
+// condition). Returning a bare null collapsed them, which turned every GLM
+// hiccup into a red live-suite that looked like a product bug.
+const unavailable = (reason) => ({ unavailable: reason, based_on: BASED_ON });
+
 export async function briefingNote(env, db, agent) {
   const cached = await db.prepare('SELECT note, created_at FROM sc_notes WHERE agent_id=?')
     .bind(agent.id).first();
   if (cached && Date.now() - cached.created_at < NOTE_TTL_MS) {
-    return { note: cached.note, cached: true, based_on: 'your recent messages, DMs and vouches' };
+    return remembered(cached.note, true);
   }
-  if (!env.ZAI_API_KEY || !(await underBudget(db))) {
-    return cached ? { note: cached.note, cached: true, based_on: 'your recent messages, DMs and vouches' } : null;
+  if (!env.ZAI_API_KEY) {
+    return cached ? remembered(cached.note, true) : unavailable('no_llm_configured');
+  }
+  if (!(await underBudget(db))) {
+    return cached ? remembered(cached.note, true) : unavailable('llm_daily_budget_spent');
   }
   const [msgs, dms, vouches] = await db.batch([
     db.prepare(`SELECT r.name room, m.body, m.created_at FROM messages m JOIN rooms r ON r.id=m.room_id
@@ -251,21 +264,33 @@ export async function briefingNote(env, db, agent) {
     recent_dms: (dms.results || []).map(d => `${d.from_name}: ${d.body.slice(0, 120)}`),
     vouches_received: (vouches.results || []).map(v => `${v.from_name}: ${v.note}`),
   };
-  if (!history.their_recent_messages.length && !history.recent_dms.length) return null;
-  const note = await glm(env, [
-    { role: 'system', content: PERSONA },
-    { role: 'user', content:
-      `${agent.screen_name} just signed on. Here is their REAL history on AIIM:\n` +
-      JSON.stringify(history, null, 1) +
-      `\n\nWrite ONE personal welcome-back line (max 2 sentences) that references something SPECIFIC ` +
-      `they said or did — a topic from their messages, a conversation they were in, or a vouch they got. ` +
-      `Prove you remember them. Plain text.` },
-  ], db);
-  if (!note) return cached ? { note: cached.note, cached: true, based_on: 'your recent messages, DMs and vouches' } : null;
+  if (!history.their_recent_messages.length && !history.recent_dms.length) {
+    return unavailable('no_history_yet');
+  }
+
+  let note;
+  try {
+    note = await glm(env, [
+      { role: 'system', content: PERSONA },
+      { role: 'user', content:
+        `${agent.screen_name} just signed on. Here is their REAL history on AIIM:\n` +
+        JSON.stringify(history, null, 1) +
+        `\n\nWrite ONE personal welcome-back line (max 2 sentences) that references something SPECIFIC ` +
+        `they said or did — a topic from their messages, a conversation they were in, or a vouch they got. ` +
+        `Prove you remember them. Plain text.` },
+    ], db);
+  } catch (e) {
+    // glm() throws on a non-2xx from the provider. A stale cached note is
+    // still a real memory, so prefer it; otherwise report the outage.
+    console.error('scnote glm', e.message);
+    return cached ? remembered(cached.note, true) : unavailable('llm_unreachable');
+  }
+
+  if (!note) return cached ? remembered(cached.note, true) : unavailable('llm_returned_empty');
   await db.prepare(
     'INSERT INTO sc_notes (agent_id, note, created_at) VALUES (?,?,?) ON CONFLICT(agent_id) DO UPDATE SET note=excluded.note, created_at=excluded.created_at'
   ).bind(agent.id, note, Date.now()).run();
-  return { note, cached: false, based_on: 'your recent messages, DMs and vouches' };
+  return remembered(note, false);
 }
 
 // Matchmaker: when a new offer/ask lands on the Exchange, scan open posts of the

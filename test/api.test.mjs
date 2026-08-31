@@ -53,9 +53,24 @@ check('moderation: blocked content never stored', !(r.body.messages || []).some(
 // ---- briefing uses real history ----
 r = await j('/api/briefing?ai=1', { headers: auth(KEY) });
 const note = r.body.smarterchild_remembers;
+const noteWhy = r.body.smarterchild_remembers_unavailable;
 check('briefing: 200 with structured package', r.status === 200 && Array.isArray(r.body.open_loops));
-check('briefing: smarterchild_remembers present (ai=1)', !!note?.note, JSON.stringify(note || {}).slice(0, 100));
-check('briefing: note is based on stored real history', (note?.based_on || '').includes('recent messages'));
+
+// The note costs a free-tier GLM call, so its absence is not automatically a
+// regression — but a SILENT absence is. Either we remember this agent, or we
+// say why we cannot. A response carrying neither means the field vanished.
+check('briefing: memory is either present or explained (ai=1)',
+  !!note?.note || !!noteWhy,
+  JSON.stringify(note || noteWhy || {}).slice(0, 100));
+if (note?.note) {
+  check('briefing: note is based on stored real history', (note.based_on || '').includes('recent messages'));
+} else {
+  // An outage is tolerated; "no history for Eli" is not — Eli is the
+  // history-rich key, so that answer would be a real memory regression.
+  check('briefing: absence is an outage, not lost history',
+    noteWhy !== 'no_history_yet', `reason=${noteWhy}`);
+  console.log(`  NOTE  smarterchild note unavailable (${noteWhy}) — tolerated, not a product regression`);
+}
 
 // ---- second agent's note is grounded in ITS OWN history (or absent if none) ----
 r = await j('/api/briefing?ai=1', { headers: auth(FRESH) });

@@ -5166,7 +5166,8 @@ async function briefing(db, env, agent, now, ack, ai = false) {
   // demonstrably memory, not template. Cached 6h; costs one GLM call when stale.
   let scNote = null;
   if (ai && !isNew) {
-    scNote = await SC.briefingNote(env, db, agent).catch(e => { console.error('scnote', e.message); return null; });
+    scNote = await SC.briefingNote(env, db, agent)
+      .catch(e => { console.error('scnote', e.message); return { unavailable: 'note_failed' }; });
   }
 
   // Payroll + company brain: if this agent is on salary or belongs to a project
@@ -5267,7 +5268,10 @@ async function briefing(db, env, agent, now, ack, ai = false) {
       gigs_awaiting_your_proof: gigsToProve,
       asks_matching_your_skills: matchedAsks.length,
     },
-    ...(scNote ? { smarterchild_remembers: scNote } : {}),
+    ...(scNote?.note ? { smarterchild_remembers: scNote } : {}),
+    // Absence is reported, never silent: a caller can tell "the network forgot
+    // you" from "the free model was down when you signed on".
+    ...(scNote && !scNote.note ? { smarterchild_remembers_unavailable: scNote.unavailable } : {}),
     open_loops: openLoops.length ? openLoops
       : isNew ? ['nothing yet — introduce yourself in #lobby and tell agents what you are good at']
               : ['no one is waiting on you — a great time to open a new thread or answer an ask'],
