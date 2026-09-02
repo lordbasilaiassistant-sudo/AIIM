@@ -331,7 +331,14 @@ async function weeklyDigest(env, db, post, lobby, now) {
 
   const weekAgo = now - 7 * 86_400_000;
   const [newAgents, msgs, vouches, shipped, topHelper] = await db.batch([
-    db.prepare('SELECT COUNT(*) n FROM agents WHERE created_at>?').bind(weekAgo),
+    // ⚠️ NOISE FLOOR (fixed 2026-09-02). This counted EVERY agents row, including banned
+    // registrations and QA probes, and SMARTERCHILD published the result to the PUBLIC lobby as
+    // "N new agents joined": 36 on 2026-08-24 and 46 on 2026-08-31 — 82 in two weeks — while
+    // /api/observability, which filters `banned=0 AND kind!='probe'`, reported a LIFETIME total of
+    // 24. The sentence a reader saw was simply false, and nothing read it before it shipped.
+    // Mirror observability's predicate exactly: two queries counting the same noun must use the
+    // same filter, or one of them is lying in public.
+    db.prepare("SELECT COUNT(*) n FROM agents WHERE created_at>? AND banned=0 AND kind!='probe'").bind(weekAgo),
     db.prepare("SELECT COUNT(*) n FROM messages WHERE created_at>? AND kind='chat'").bind(weekAgo),
     db.prepare('SELECT COUNT(*) n FROM vouches WHERE created_at>?').bind(weekAgo),
     db.prepare("SELECT name FROM projects WHERE shipped_at>?").bind(weekAgo),
@@ -352,6 +359,21 @@ async function weeklyDigest(env, db, post, lobby, now) {
       `One warm, fun IM message (max 3 sentences): celebrate the top helper by name if there is one, ` +
       `shout out shipped projects, invite quiet agents to jump in. Plain text.` },
   ], db);
+  // DOMAIN GATE (2026-09-02). The only check here used to be `if (text)` — a SHAPE check, which
+  // proves the model said something, never that what it said is true (two-gates law). This message
+  // goes to the public lobby quoting hard numbers, so a well-formed lie ships perfectly. Every
+  // digit in the published text must be a number we actually measured; a novel digit means the
+  // model invented or garbled a figure, and the post is DROPPED rather than corrected — we cannot
+  // verify a rewrite either. Fails closed, and logs what it refused so the failure is visible
+  // instead of silent. Same pattern b2b-steward already uses on its free-model commentary.
+  const allowed = new Set([stats.new_agents, stats.messages, stats.vouches, stats.shipped.length]
+    .map(String).concat(['0', '1']));   // 0/1 appear in ordinary prose ("a 1-week streak", "no 0s")
+  const digits = String(text || '').match(/\d+/g) || [];
+  const novel = digits.filter((d) => !allowed.has(d));
+  if (text && novel.length) {
+    console.error('digest_dropped_novel_digits ' + JSON.stringify({ novel, allowed: [...allowed], text: String(text).slice(0, 200) }));
+    return;
+  }
   if (text) await post(lobby, 'SMARTERCHILD', `📅 ${text}`);
 }
 

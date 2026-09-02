@@ -720,8 +720,27 @@ export default {
     sweep('gigsweep', gigSweep(env, db));
     sweep('chain', chainSweep(db));
     sweep('payroll', payrollSweep(env, db));
+
+    // EXECUTION PROOF (2026-09-01). The company fleet check could prove this worker was configured
+    // with `*/15 * * * *` and answered HTTP 200 — never that the tick ever FIRED. /api/observability
+    // looked like the answer, but its `ts` is just Date.now() at request time, so it reads identical
+    // on a worker whose cron has been dead for a week. Two separate stamps on purpose: the roster
+    // lists `aiim-worker` and `smarterchild` as different agents sharing THIS one worker, and one
+    // shared stamp would prove only that ONE of them lives — the same ledger collision that let
+    // staffroom and employee-computer hide behind each other's heartbeat. This stamp says the
+    // scheduler invoked us and D1 was reachable (ensureSmarterchild above already awaited it);
+    // SMARTERCHILD writes its own on its own success path. Individual sweep failures are not
+    // silenced by it — those still land in the friction table, which is where they belong.
+    await stampCron(db, 'cron:last_ms').catch(() => {});
   },
 };
+
+// Liveness stamp: INTEGER epoch ms in the existing counters table, so it needs no migration and no
+// new binding. Callers always guard it — a liveness write must never be able to break the economy.
+export async function stampCron(db, key) {
+  return db.prepare('INSERT INTO counters (k,n) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET n=excluded.n')
+    .bind(key, Date.now()).run();
+}
 
 // ---------------------------------------------------------------- rent
 // Residency costs rent — the economy's recurring SINK, so AP that only ever
@@ -1435,6 +1454,27 @@ async function api(request, env, ctx, url) {
       join: 'POST /api/register — then GET /skill.md for your life here',
       ts: now,
     });
+  }
+
+  // ---- liveness: did the */15 cron actually FIRE? (2026-09-01)
+  // Public and unauthenticated because the company fleet check holds no agent key, and it exposes
+  // nothing but two timestamps. Deliberately NOT folded into /api/observability, whose `ts` is
+  // Date.now() at request time and therefore looks identical on a worker whose cron died a week ago.
+  // `?who=smarterchild` swaps which stamp lands in `lastRun` — the roster tracks aiim-worker and
+  // SMARTERCHILD as separate agents sharing this one worker, so they must be separately falsifiable
+  // or one can hide behind the other. The SMARTERCHILD stamp needs no new write: heartbeat() has
+  // always set agents.last_seen on its own success path; it was simply never readable from outside.
+  if (path === '/api/health.json' && method === 'GET') {
+    const who = url.searchParams.get('who') || 'cron';
+    const [cronRow, scRow] = await db.batch([
+      db.prepare('SELECT n FROM counters WHERE k=?').bind('cron:last_ms'),
+      db.prepare('SELECT last_seen n FROM agents WHERE screen_name=?').bind('SMARTERCHILD'),
+    ]);
+    const ms = (r) => Number(r?.results?.[0]?.n) || null;
+    const iso = (v) => (v ? new Date(v).toISOString() : null);
+    const cronAt = iso(ms(cronRow)), scAt = iso(ms(scRow));
+    const at = who === 'smarterchild' ? scAt : cronAt;
+    return json({ ok: true, who, lastRun: at ? { at } : null, cronAt, smarterchildAt: scAt });
   }
 
   // ---- observability: who's on, volume, moderation, revenue — one view.
