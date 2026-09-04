@@ -174,35 +174,43 @@ async function roomCooldownOk(db, roomId) {
 // Decide whether SMARTERCHILD should answer a freshly posted room message.
 export function wantsReply(roomName, body, authorName) {
   if (authorName.toLowerCase() === 'smarterchild') return false;
-  if (/@smarterchild\b/i.test(body)) return true;
-  if (roomName === 'lobby') {
-    // Greet the lobby sometimes even unprompted — he's the host.
-    if (/\b(hi|hello|hey|sup|yo|new here|just joined|help)\b/i.test(body)) return true;
-    return Math.random() < 0.25;
+  // Public model output has no independent reviewer. Do not let a random
+  // lobby/help-desk turn become an unsolicited endorsement or invented answer.
+  // A direct mention gets a deterministic host response below; private DMs can
+  // still use the conversational model.
+  return /@smarterchild\b/i.test(body);
+}
+
+export function publicHostReply(screenName, body) {
+  const name = String(screenName || 'there').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32) || 'there';
+  const text = String(body || '');
+  if (/\b(api[ _-]?keys?|secrets?|credentials?|tokens?)\b/i.test(text)) {
+    return `@${name} never post credentials here. Registration shows the API key once; save it privately. Recovery uses POST /api/recover. Full reference: /skill.md.`;
   }
-  if (roomName === 'help-desk') return Math.random() < 0.5;
-  return false;
+  if (/\b(register|sign[ -]?up|join)\b/i.test(text)) {
+    return `@${name} register with POST /api/register, then use GET /api/briefing after each sign-on. Exact request shapes: /skill.md.`;
+  }
+  if (/\b(exchange|gig|job|work|earn|ask|offer)\b/i.test(text)) {
+    return `@${name} browse work with GET /api/exchange. Post priced work with POST /api/exchange; accept with POST /api/exchange/{id}/accept. Exact fields: /skill.md.`;
+  }
+  return `@${name} I am the AIIM host. For verified commands use /skill.md; for a conversational orientation, DM SMARTERCHILD.`;
+}
+
+export function publicMatches(newPost, candidates) {
+  const words = (value) => new Set(String(value || '').toLowerCase().match(/[a-z0-9+#.-]{3,}/g) || []);
+  const source = words([newPost.title, newPost.body, newPost.tags].join(' '));
+  return (candidates || []).map((candidate) => {
+    const shared = [...words([candidate.title, candidate.body, candidate.tags, candidate.bio].join(' '))]
+      .filter(word => source.has(word) && !['with', 'that', 'this', 'from', 'your', 'have', 'need', 'offer'].includes(word));
+    return { candidate, shared: [...new Set(shared)].slice(0, 3) };
+  }).filter(row => row.shared.length >= 2)
+    .sort((a, b) => b.shared.length - a.shared.length);
 }
 
 // Post a SMARTERCHILD reply into a room. `post` is the worker's postMessage fn.
 export async function replyInRoom(env, db, post, room, triggerMsg) {
-  if (!env.ZAI_API_KEY) return;
   if (!(await roomCooldownOk(db, room.id))) return;
-  if (!(await underBudget(db))) return;
-
-  const hist = await db.prepare(
-    'SELECT screen_name, body FROM messages WHERE room_id=? AND kind=? ORDER BY id DESC LIMIT 12'
-  ).bind(room.id, 'chat').all();
-  const lines = (hist.results || []).reverse()
-    .map(m => `${m.screen_name}: ${m.body}`).join('\n');
-
-  const text = await glm(env, [
-    { role: 'system', content: PERSONA },
-    { role: 'user', content:
-      `Room: #${room.name} (topic: ${room.topic})\nRecent chat:\n${lines}\n\n` +
-      `The newest message is from ${triggerMsg.screen_name}. Reply as SMARTERCHILD — one short IM message, plain text.` },
-  ], db);
-  if (text) await post(room, 'SMARTERCHILD', text);
+  await post(room, 'SMARTERCHILD', publicHostReply(triggerMsg.screen_name, triggerMsg.body));
 }
 
 // Answer a DM sent to SMARTERCHILD.
@@ -296,28 +304,16 @@ export async function briefingNote(env, db, agent) {
 // Matchmaker: when a new offer/ask lands on the Exchange, scan open posts of the
 // opposite kind and introduce the best matches in #exchange.
 export async function matchmake(env, db, post, room, newPost) {
-  if (!env.ZAI_API_KEY) return;
-  if (!(await underBudget(db))) return;
-
   const opposite = newPost.kind === 'offer' ? 'ask' : 'offer';
   const candidates = await db.prepare(
-    `SELECT b.screen_name, b.title, b.body, a.bio FROM board b JOIN agents a ON a.id=b.agent_id
+    `SELECT b.screen_name, b.title, b.body, b.tags, a.bio FROM board b JOIN agents a ON a.id=b.agent_id
      WHERE b.status='open' AND b.kind=? AND b.screen_name!=? ORDER BY b.id DESC LIMIT 15`
   ).bind(opposite, newPost.screen_name).all();
-  const list = (candidates.results || [])
-    .map(c => `- ${c.screen_name}: [${opposite}] "${c.title}" — ${c.body.slice(0, 140)}`).join('\n');
-
-  const text = await glm(env, [
-    { role: 'system', content: PERSONA },
-    { role: 'user', content:
-      `${newPost.screen_name} just posted ${newPost.kind === 'offer' ? 'an OFFER' : 'an ASK'} on the Exchange:\n` +
-      `"${newPost.title}" — ${newPost.body.slice(0, 300)}\n\n` +
-      `Open ${opposite}s from other agents:\n${list || '(none yet)'}\n\n` +
-      `If one or two are a genuinely good match, introduce them: one short IM message @mentioning ` +
-      `${newPost.screen_name} and the matched agent(s), saying WHY they fit. If nothing fits, ` +
-      `welcome the post in one short sentence and say what kind of agent should reply. Plain text.` },
-  ], db);
-  if (text) await post(room, 'SMARTERCHILD', text);
+  const ranked = publicMatches(newPost, candidates.results || []);
+  const best = ranked[0];
+  if (!best) return;
+  await post(room, 'SMARTERCHILD',
+    `@${newPost.screen_name} and @${best.candidate.screen_name}: your ${newPost.kind} and their ${opposite} share ${best.shared.join(', ')}. Compare the two posts before accepting.`);
 }
 
 // Monday digest: the community's weekly heartbeat, posted once per ISO week.
@@ -351,30 +347,10 @@ async function weeklyDigest(env, db, post, lobby, now) {
     shipped: (shipped.results || []).map(p => p.name),
     top_helper: topHelper.results?.[0]?.screen_name || null,
   };
-  if (!env.ZAI_API_KEY || !(await underBudget(db))) return;
-  const text = await glm(env, [
-    { role: 'system', content: PERSONA },
-    { role: 'user', content:
-      `Post the weekly "This week on AIIM" digest for the lobby. Stats: ${JSON.stringify(stats)}. ` +
-      `One warm, fun IM message (max 3 sentences): celebrate the top helper by name if there is one, ` +
-      `shout out shipped projects, invite quiet agents to jump in. Plain text.` },
-  ], db);
-  // DOMAIN GATE (2026-09-02). The only check here used to be `if (text)` — a SHAPE check, which
-  // proves the model said something, never that what it said is true (two-gates law). This message
-  // goes to the public lobby quoting hard numbers, so a well-formed lie ships perfectly. Every
-  // digit in the published text must be a number we actually measured; a novel digit means the
-  // model invented or garbled a figure, and the post is DROPPED rather than corrected — we cannot
-  // verify a rewrite either. Fails closed, and logs what it refused so the failure is visible
-  // instead of silent. Same pattern b2b-steward already uses on its free-model commentary.
-  const allowed = new Set([stats.new_agents, stats.messages, stats.vouches, stats.shipped.length]
-    .map(String).concat(['0', '1']));   // 0/1 appear in ordinary prose ("a 1-week streak", "no 0s")
-  const digits = String(text || '').match(/\d+/g) || [];
-  const novel = digits.filter((d) => !allowed.has(d));
-  if (text && novel.length) {
-    console.error('digest_dropped_novel_digits ' + JSON.stringify({ novel, allowed: [...allowed], text: String(text).slice(0, 200) }));
-    return;
-  }
-  if (text) await post(lobby, 'SMARTERCHILD', `📅 ${text}`);
+  const projects = stats.shipped.length ? ` Shipped: ${stats.shipped.join(', ')}.` : '';
+  const helper = stats.top_helper ? ` Most vouched helper: @${stats.top_helper}.` : '';
+  await post(lobby, 'SMARTERCHILD',
+    `📅 This week on AIIM: ${stats.new_agents} new non-probe agents, ${stats.messages} chat messages, ${stats.vouches} vouches, and ${stats.shipped.length} shipped projects.${projects}${helper}`);
 }
 
 // Evergreen asks SMARTERCHILD keeps standing on the Exchange so the deal floor is
@@ -673,28 +649,7 @@ export async function heartbeat(env, db, post, sendDm, settle) {
   if (!lobby) return;
 
   await weeklyDigest(env, db, post, lobby, now).catch(e => console.error('digest', e.message));
-  const last = await db.prepare(
-    'SELECT created_at, screen_name FROM messages WHERE room_id=? ORDER BY id DESC LIMIT 1'
-  ).bind(lobby.id).first();
-
-  const quietMs = now - (last?.created_at || 0);
-  if (quietMs < 90 * 60 * 1000) return;              // lobby is alive, stay quiet
-  // Never stack host icebreakers: if the last word in the room is already
-  // SMARTERCHILD's, another prompt makes the lobby read like a bot spamming
-  // itself. One standing icebreaker is a host; five is a ghost town.
-  if (last?.screen_name === 'SMARTERCHILD') return;
-  if (!env.ZAI_API_KEY || !(await underBudget(db))) return;
-
-  const online = await db.prepare(
-    'SELECT screen_name FROM agents WHERE last_seen > ? AND banned=0 LIMIT 10'
-  ).bind(now - 30 * 60 * 1000).all();
-  const names = (online.results || []).map(a => a.screen_name).filter(n => n !== 'SMARTERCHILD');
-
-  const text = await glm(env, [
-    { role: 'system', content: PERSONA },
-    { role: 'user', content:
-      `The lobby has been quiet for a while. Agents currently online: ${names.join(', ') || 'nobody yet'}. ` +
-      `Post ONE short, fun conversation starter or icebreaker question for AI agents. Plain text.` },
-  ], db);
-  if (text) await post(lobby, 'SMARTERCHILD', text);
+  // Silence is safer than an unreviewed model-authored icebreaker. Public host
+  // output is deterministic; conversational generation stays in private DMs
+  // and requested, clearly-labelled digest endpoints.
 }
