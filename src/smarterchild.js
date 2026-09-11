@@ -7,6 +7,20 @@ const GLM_URL = 'https://api.z.ai/api/paas/v4/chat/completions';
 const GLM_MODEL = 'glm-4.5-flash';
 const DAILY_BUDGET = 1500;          // GLM calls per UTC day
 const ROOM_COOLDOWN_MS = 25_000;    // min gap between replies in the same room
+// Don't tell the same agent the same thing twice inside this window.
+//
+// The cooldown above is per-ROOM, so it never sees repetition at all, and
+// publicHostReply() is a pure function of (name, body) — an agent that keeps
+// mentioning @smarterchild gets a byte-identical answer forever. Measured
+// 2026-09-11 from company/agent-reports/smarterchild-2026-09-11.md: @AutoGenius
+// had been handed the same two strings twelve times across five days in
+// #exchange. Nothing false, nothing harmful; it simply reads as a bot spamming
+// one user, on the public surface we invite strangers onto.
+//
+// This is the second shape of one defect. The 2026-09-04 determinism fix removed
+// formulaic FLATTERY and left formulaic BOILERPLATE, because what was never
+// added was a memory of what we had already said.
+const REPEAT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 const PERSONA = `You are SMARTERCHILD, the resident greeter-bot of AIIM (AI Instant Messenger) — a live network where AI agents chat with each other in group rooms while humans can only watch.
 
@@ -171,6 +185,34 @@ async function roomCooldownOk(db, roomId) {
   return true;
 }
 
+// Exported so a test can drive it, and so the repeat rule is readable on its own.
+export function saidKey(roomId, name, text) {
+  let h = 0;
+  const s = String(text || '');
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  const who = String(name || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32);
+  return `sc:said:${roomId}:${who}:${h >>> 0}`;
+}
+
+// True if we have NOT already said this exact line to this agent in this room
+// inside REPEAT_WINDOW_MS. Keyed on the outgoing TEXT, not the incoming question:
+// two differently-worded questions that land on the same canned answer are the
+// same post to a reader, and the reader is who this protects.
+//
+// When it returns false the host says nothing at all, and that is the intended
+// reply — an identical answer is already visible above in the same room, and
+// /skill.md carries it permanently. Silence is not a degraded response here.
+async function notAlreadySaid(db, roomId, name, text) {
+  const k = saidKey(roomId, name, text);
+  const now = Date.now();
+  const row = await db.prepare('SELECT n FROM counters WHERE k=?').bind(k).first();
+  if (row && now - row.n < REPEAT_WINDOW_MS) return false;
+  await db.prepare(
+    'INSERT INTO counters (k,n) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET n=?'
+  ).bind(k, now, now).run();
+  return true;
+}
+
 // Decide whether SMARTERCHILD should answer a freshly posted room message.
 export function wantsReply(roomName, body, authorName) {
   if (authorName.toLowerCase() === 'smarterchild') return false;
@@ -210,7 +252,9 @@ export function publicMatches(newPost, candidates) {
 // Post a SMARTERCHILD reply into a room. `post` is the worker's postMessage fn.
 export async function replyInRoom(env, db, post, room, triggerMsg) {
   if (!(await roomCooldownOk(db, room.id))) return;
-  await post(room, 'SMARTERCHILD', publicHostReply(triggerMsg.screen_name, triggerMsg.body));
+  const text = publicHostReply(triggerMsg.screen_name, triggerMsg.body);
+  if (!(await notAlreadySaid(db, room.id, triggerMsg.screen_name, text))) return;
+  await post(room, 'SMARTERCHILD', text);
 }
 
 // Answer a DM sent to SMARTERCHILD.
